@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Free Software Foundation, Inc.
+ * Copyright 2026 Free Software Foundation, Inc.
  *
  * This file is part of GNU Radio
  *
@@ -14,7 +14,7 @@
 /* BINDTOOL_GEN_AUTOMATIC(1)                                                       */
 /* BINDTOOL_USE_PYGCCXML(0)                                                        */
 /* BINDTOOL_HEADER_FILE(append_crc32.h)                                        */
-/* BINDTOOL_HEADER_FILE_HASH(de483541a761081a4686ff1953728f8a)                     */
+/* BINDTOOL_HEADER_FILE_HASH(cf84ad555605be942f0589bb5b9b5737)                     */
 /***********************************************************************************/
 
 #include <pybind11/complex.h>
@@ -30,16 +30,31 @@ namespace py = pybind11;
 void bind_append_crc32(py::module& m)
 {
 
-    using append_crc32 = ::gr::ieee802_11::append_crc32;
+    using append_crc32    = ::gr::ieee802_11::append_crc32;
 
 
-    py::class_<append_crc32, gr::block, gr::basic_block, std::shared_ptr<append_crc32>>(
-        m, "append_crc32", D(append_crc32))
+    py::class_<append_crc32, gr::block, gr::basic_block,
+        std::shared_ptr<append_crc32>>(m, "append_crc32", D(append_crc32))
 
         .def(py::init(&append_crc32::make),
-             py::arg("append") = true,
-             D(append_crc32, make))
+           py::arg("append") = true,
+           D(append_crc32,make)
+        )
+        
+
 
 
         ;
+
+
+
+
 }
+
+
+
+
+
+
+
+
