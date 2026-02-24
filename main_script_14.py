@@ -654,7 +654,8 @@ class wifi_rx_file(gr.top_block):
         self.samp_rate = 20e6
         #self.samp_rate = 40e6
         #self.freq = 5.89e9
-        self.freq = 5.211e9
+        #self.freq = 5.211e9
+        self.freq = 5.180e9
         #self.freq = 5e9
         self.chan_est = ieee802_11.LS
         #self.chan_est = ieee802_11.LMS
