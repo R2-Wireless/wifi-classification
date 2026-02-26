@@ -34,6 +34,24 @@
       ]
     },
     {
+      "name": "Python (debugpy): main_script_14.py regular (prints+plots)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main_script_14.py",
+      "args": [
+        "/mnt/c/Users/Public/Documents/Wify/Py_script/cfiles/Neo2_19_02/Neo2-Wifi-5180MHz-02-19-26-15h57m06s639_0001_20mhz_SNR_Both_dB.cfile",
+        "/tmp/debug_output.pcap"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1",
+        "MPLBACKEND": "TkAgg",
+        "PYTHONPATH": "${workspaceFolder}/external/python:${workspaceFolder}/external/build/python/bindings:${workspaceFolder}/external/build/python:${env:PYTHONPATH}",
+        "LD_LIBRARY_PATH": "${workspaceFolder}/external/build/lib:${env:LD_LIBRARY_PATH}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
       "name": "Python (debugpy): main_script_14.py verbose",
       "type": "debugpy",
       "request": "launch",

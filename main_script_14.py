@@ -89,6 +89,15 @@ class MacResolver:
 
 TYPE_NAMES = {0: "Management", 1: "Control", 2: "Data", 3: "Reserved"}
 
+# Hard-coded frame-type decode selection flags.
+# Set True/False per type to keep/drop frames in this script.
+DECODE_FRAME_TYPE = {
+    0: True,   # Management
+    1: True,  # Control
+    2: True,  # Data
+    3: True,  # Extension/Reserved
+}
+
 MGMT_SUBTYPE_NAMES = {
     0: "Association Request", 1: "Association Response", 2: "Reassociation Request",
     3: "Reassociation Response", 4: "Probe Request", 5: "Probe Response",
@@ -529,6 +538,9 @@ class message_handler(gr.sync_block):
             if fc_info["version"] != 0:
                 self.stats.add_failure("Invalid 802.11 version")
                 print("CHECKSUM: Checksum FAILED - Invalid 802.11 version")
+                return
+
+            if not DECODE_FRAME_TYPE.get(fc_info["type"], False):
                 return
 
             roles = derive_address_roles(data, fc_info)
