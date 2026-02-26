@@ -22,6 +22,7 @@
 #define INCLUDED_IEEE802_11_EXTRACT_CSI_IMPL_H
 
 #include <ieee802_11/extract_csi.h>
+#include <cstdint>
 
 namespace gr {
 namespace ieee802_11 {
@@ -31,6 +32,10 @@ class extract_csi_impl : public extract_csi
 private:
     pmt::pmt_t d_meta;
     std::vector<gr_complex> d_csi;
+    uint64_t d_work_calls;
+    uint64_t d_items_in;
+    uint64_t d_items_out;
+    uint64_t d_work_time_ns;
 
 public:
     extract_csi_impl();

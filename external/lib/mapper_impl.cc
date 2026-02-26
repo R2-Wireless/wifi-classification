@@ -15,8 +15,12 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include "utils.h"
+#include "timing_stats.h"
 #include <gnuradio/io_signature.h>
 #include <ieee802_11/mapper.h>
+#include <chrono>
+#include <cstdint>
+#include <iostream>
 
 using namespace gr::ieee802_11;
 
@@ -34,14 +38,32 @@ public:
           d_symbols(NULL),
           d_debug(debug),
           d_scrambler(1),
-          d_ofdm(e)
+          d_ofdm(e),
+          d_work_calls(0),
+          d_items_in(0),
+          d_items_out(0),
+          d_work_time_ns(0)
     {
 
         message_port_register_in(pmt::mp("in"));
         set_encoding(e);
     }
 
-    ~mapper_impl() { free(d_symbols); }
+    ~mapper_impl()
+    {
+        if (d_work_calls) {
+            timing_stats::add_block_timing(
+                "mapper", d_work_calls, d_items_in, d_items_out, d_work_time_ns);
+            const double total_ms = static_cast<double>(d_work_time_ns) / 1e6;
+            const double avg_us = static_cast<double>(d_work_time_ns) / d_work_calls / 1e3;
+            std::cout << "[timing] mapper calls=" << d_work_calls
+                      << " in=" << d_items_in
+                      << " out=" << d_items_out
+                      << " total_ms=" << total_ms
+                      << " avg_us=" << avg_us << std::endl;
+        }
+        free(d_symbols);
+    }
 
     void print_message(const char* msg, size_t len)
     {
@@ -63,6 +85,15 @@ public:
                      gr_vector_const_void_star& input_items,
                      gr_vector_void_star& output_items)
     {
+        const auto t_start = std::chrono::steady_clock::now();
+        auto finish = [&](int produced) {
+            d_work_calls++;
+            d_items_out += produced;
+            d_work_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - t_start)
+                                  .count();
+            return produced;
+        };
 
         unsigned char* out = (unsigned char*)output_items[0];
         dout << "MAPPER called offset: " << d_symbols_offset
@@ -72,7 +103,7 @@ public:
             pmt::pmt_t msg(delete_head_nowait(pmt::intern("in")));
 
             if (!msg.get()) {
-                return 0;
+                return finish(0);
             }
 
             if (pmt::is_pair(msg)) {
@@ -88,7 +119,7 @@ public:
                 if (frame.n_sym > MAX_SYM) {
                     std::cout << "packet too large, maximum number of symbols is "
                               << MAX_SYM << std::endl;
-                    return 0;
+                    return finish(0);
                 }
 
                 // alloc memory for modulation steps
@@ -165,7 +196,7 @@ public:
             d_symbols = 0;
         }
 
-        return i;
+        return finish(i);
     }
 
     void set_encoding(Encoding encoding)
@@ -185,6 +216,10 @@ private:
     int d_symbols_len;
     ofdm_param d_ofdm;
     gr::thread::mutex d_mutex;
+    uint64_t d_work_calls;
+    uint64_t d_items_in;
+    uint64_t d_items_out;
+    uint64_t d_work_time_ns;
 };
 
 mapper::sptr mapper::make(Encoding mcs, bool debug)

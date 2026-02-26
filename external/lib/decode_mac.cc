@@ -16,12 +16,18 @@
  */
 #include <ieee802_11/decode_mac.h>
 
+#include "frame_trace.h"
+#include "timing_stats.h"
 #include "utils.h"
 #include "viterbi_decoder/viterbi_decoder.h"
 
 #include <gnuradio/io_signature.h>
 #include <boost/crc.hpp>
 #include <iomanip>
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <iostream>
 
 using namespace gr::ieee802_11;
 
@@ -40,10 +46,31 @@ public:
           d_ofdm(BPSK_1_2),
           d_frame(d_ofdm, 0),
           copied(0),
-          d_frame_complete(true)
+          d_frame_complete(true),
+          d_current_frame_id(0),
+          d_work_calls(0),
+          d_items_in(0),
+          d_items_out(0),
+          d_work_time_ns(0)
     {
         message_port_register_out(pmt::mp("out"));
         message_port_register_out(pmt::mp("out_fail"));
+    }
+
+    ~decode_mac_impl()
+    {
+        if (!d_work_calls) {
+            return;
+        }
+        timing_stats::add_block_timing(
+            "decode_mac", d_work_calls, d_items_in, d_items_out, d_work_time_ns);
+        const double total_ms = static_cast<double>(d_work_time_ns) / 1e6;
+        const double avg_us = static_cast<double>(d_work_time_ns) / d_work_calls / 1e3;
+        std::cout << "[timing] decode_mac calls=" << d_work_calls
+                  << " in=" << d_items_in
+                  << " out=" << d_items_out
+                  << " total_ms=" << total_ms
+                  << " avg_us=" << avg_us << std::endl;
     }
 
     int general_work(int noutput_items,
@@ -51,6 +78,7 @@ public:
                      gr_vector_const_void_star& input_items,
                      gr_vector_void_star& output_items)
     {
+        const auto t_start = std::chrono::steady_clock::now();
 
         const uint8_t* in = (const uint8_t*)input_items[0];
 
@@ -68,11 +96,18 @@ public:
 
             if (tags.size()) {
                 if (d_frame_complete == false) {
+                    if (d_current_frame_id) {
+                        frame_trace::note_decode(
+                            d_current_frame_id, "interrupted_by_new_frame");
+                        frame_trace::note_outcome(d_current_frame_id, "dropped");
+                    }
                     dout << "Warning: starting to receive new frame before old frame was "
                             "complete"
                          << std::endl;
                     dout << "Already copied " << copied << " out of " << d_frame.n_sym
-                         << " symbols of last frame" << std::endl;
+                         << " symbols of last frame"
+                         << " (left=" << std::max(0, d_frame.n_sym - copied) << ")"
+                         << std::endl;
                 }
                 d_frame_complete = false;
 
@@ -85,6 +120,11 @@ public:
                     d_meta, pmt::mp("frame bytes"), pmt::from_uint64(MAX_PSDU_SIZE + 1)));
                 int encoding = pmt::to_uint64(
                     pmt::dict_ref(d_meta, pmt::mp("encoding"), pmt::from_uint64(0)));
+                d_current_frame_id =
+                    pmt::to_uint64(pmt::dict_ref(d_meta, pmt::mp("frame_id"), pmt::from_uint64(0)));
+                if (d_current_frame_id) {
+                    frame_trace::note_decode(d_current_frame_id, "tag_received");
+                }
 
                 ofdm_param ofdm = ofdm_param((Encoding)encoding);
                 frame_param frame = frame_param(ofdm, len_data);
@@ -94,9 +134,16 @@ public:
                     d_ofdm = ofdm;
                     d_frame = frame;
                     copied = 0;
+                    if (d_current_frame_id) {
+                        frame_trace::note_decode(d_current_frame_id, "collecting_symbols");
+                    }
                     dout << "Decode MAC: frame start -- len " << len_data << "  symbols "
                          << frame.n_sym << "  encoding " << encoding << std::endl;
                 } else {
+                    if (d_current_frame_id) {
+                        frame_trace::note_decode(d_current_frame_id, "frame_too_large");
+                        frame_trace::note_outcome(d_current_frame_id, "dropped");
+                    }
                     dout << "Dropping frame which is too large (symbols or bits)"
                          << std::endl;
                 }
@@ -110,6 +157,9 @@ public:
 
                 if (copied == d_frame.n_sym) {
                     dout << "received complete frame - decoding" << std::endl;
+                    if (d_current_frame_id) {
+                        frame_trace::note_decode(d_current_frame_id, "decode_called");
+                    }
                     decode();
                     in += 48;
                     i++;
@@ -123,6 +173,12 @@ public:
         }
 
         consume(0, i);
+        d_work_calls++;
+        d_items_in += i;
+        d_items_out += 0;
+        d_work_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - t_start)
+                              .count();
 
         return 0;
     }
@@ -198,11 +254,19 @@ public:
         d_meta = pmt::dict_add(d_meta, pmt::mp("fcs_residue"), pmt::from_uint64(residue));
 
         if (!fcs_ok) {
+            if (d_current_frame_id) {
+                frame_trace::note_decode(d_current_frame_id, "fcs_fail");
+                frame_trace::note_outcome(d_current_frame_id, "out_fail");
+            }
             dout << "checksum wrong -- publishing to out_fail" << std::endl;
             message_port_pub(pmt::mp("out_fail"), pmt::cons(d_meta, blob));
             return;
         }
 
+        if (d_current_frame_id) {
+            frame_trace::note_decode(d_current_frame_id, "fcs_pass");
+            frame_trace::note_outcome(d_current_frame_id, "out");
+        }
         message_port_pub(pmt::mp("out"), pmt::cons(d_meta, blob));
     }
 
@@ -297,6 +361,11 @@ private:
 
     int copied;
     bool d_frame_complete;
+    uint64_t d_current_frame_id;
+    uint64_t d_work_calls;
+    uint64_t d_items_in;
+    uint64_t d_items_out;
+    uint64_t d_work_time_ns;
 };
 
 decode_mac::sptr decode_mac::make(bool log, bool debug)

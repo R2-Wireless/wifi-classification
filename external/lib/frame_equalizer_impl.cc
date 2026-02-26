@@ -21,8 +21,12 @@
 #include "equalizer/ls.h"
 #include "equalizer/sta.h"
 #include "frame_equalizer_impl.h"
+#include "frame_trace.h"
+#include "timing_stats.h"
 #include "utils.h"
 #include <gnuradio/io_signature.h>
+#include <chrono>
+#include <iostream>
 
 namespace gr {
 namespace ieee802_11 {
@@ -41,6 +45,7 @@ frame_equalizer_impl::frame_equalizer_impl(
                 gr::io_signature::make(1, 1, 64 * sizeof(gr_complex)),
                 gr::io_signature::make(1, 1, 48)),
       d_current_symbol(0),
+      d_current_frame_id(0),
       d_log(log),
       d_debug(debug),
       d_equalizer(NULL),
@@ -50,7 +55,11 @@ frame_equalizer_impl::frame_equalizer_impl(
       d_frame_symbols(0),
       d_freq_offset_from_synclong(0.0),
       d_cfo_short_from_synclong(0.0),
-      d_cfo_long_from_synclong(0.0)
+      d_cfo_long_from_synclong(0.0),
+      d_work_calls(0),
+      d_items_in(0),
+      d_items_out(0),
+      d_work_time_ns(0)
 {
 
     message_port_register_out(pmt::mp("symbols"));
@@ -66,7 +75,21 @@ frame_equalizer_impl::frame_equalizer_impl(
     set_algorithm(algo);
 }
 
-frame_equalizer_impl::~frame_equalizer_impl() {}
+frame_equalizer_impl::~frame_equalizer_impl()
+{
+    if (!d_work_calls) {
+        return;
+    }
+    timing_stats::add_block_timing(
+        "frame_equalizer", d_work_calls, d_items_in, d_items_out, d_work_time_ns);
+    const double total_ms = static_cast<double>(d_work_time_ns) / 1e6;
+    const double avg_us = static_cast<double>(d_work_time_ns) / d_work_calls / 1e3;
+    std::cout << "[timing] frame_equalizer calls=" << d_work_calls
+              << " in=" << d_items_in
+              << " out=" << d_items_out
+              << " total_ms=" << total_ms
+              << " avg_us=" << avg_us << std::endl;
+}
 
 
 void frame_equalizer_impl::set_algorithm(Equalizer algo)
@@ -120,6 +143,7 @@ int frame_equalizer_impl::general_work(int noutput_items,
                                        gr_vector_const_void_star& input_items,
                                        gr_vector_void_star& output_items)
 {
+    const auto t_start = std::chrono::steady_clock::now();
 
     gr::thread::scoped_lock lock(d_mutex);
 
@@ -143,6 +167,7 @@ int frame_equalizer_impl::general_work(int noutput_items,
             d_current_symbol = 0;
             d_frame_symbols = 0;
             d_frame_mod = d_bpsk;
+            d_current_frame_id = 0;
 
             const double cfo_diff_rad_per_samp = pmt::to_double(tags.front().value);
             d_freq_offset_from_synclong = cfo_diff_rad_per_samp * d_bw / (2 * M_PI);
@@ -173,6 +198,17 @@ int frame_equalizer_impl::general_work(int noutput_items,
                     pmt::to_double(cfo_long_tags.front().value) * d_bw / (2 * M_PI);
             } else {
                 d_cfo_long_from_synclong = 0.0;
+            }
+
+            std::vector<gr::tag_t> frame_id_tags;
+            get_tags_in_window(frame_id_tags,
+                               0,
+                               i,
+                               i + 1,
+                               pmt::string_to_symbol("frame_id"));
+            if (frame_id_tags.size()) {
+                d_current_frame_id = pmt::to_uint64(frame_id_tags.front().value);
+                frame_trace::note_equalizer(d_current_frame_id, "wifi_start_seen");
             }
 
             dout << "epsilon: " << d_epsilon0 << std::endl;
@@ -247,6 +283,9 @@ int frame_equalizer_impl::general_work(int noutput_items,
         if (d_current_symbol == 2) {
 
             if (decode_signal_field(out + o * 48)) {
+                if (d_current_frame_id) {
+                    frame_trace::note_equalizer(d_current_frame_id, "signal_ok");
+                }
 
                 pmt::pmt_t dict = pmt::make_dict();
                 dict = pmt::dict_add(
@@ -271,6 +310,10 @@ int frame_equalizer_impl::general_work(int noutput_items,
                 std::vector<gr_complex> csi = d_equalizer->get_csi();
                 dict = pmt::dict_add(
                     dict, pmt::mp("csi"), pmt::init_c32vector(csi.size(), csi));
+                if (d_current_frame_id) {
+                    dict = pmt::dict_add(
+                        dict, pmt::mp("frame_id"), pmt::from_uint64(d_current_frame_id));
+                }
 
                 pmt::pmt_t pairs = pmt::dict_items(dict);
                 for (int i = 0; i < pmt::length(pairs); i++) {
@@ -281,6 +324,8 @@ int frame_equalizer_impl::general_work(int noutput_items,
                                  pmt::cdr(pair),
                                  alias_pmt());
                 }
+            } else if (d_current_frame_id) {
+                frame_trace::note_equalizer(d_current_frame_id, "signal_fail");
             }
         }
 
@@ -297,6 +342,12 @@ int frame_equalizer_impl::general_work(int noutput_items,
     }
 
     consume(0, i);
+    d_work_calls++;
+    d_items_in += i;
+    d_items_out += o;
+    d_work_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - t_start)
+                          .count();
     return o;
 }
 
@@ -339,6 +390,9 @@ bool frame_equalizer_impl::parse_signal(uint8_t* decoded_bits)
 
     if (parity != decoded_bits[17]) {
         dout << "SIGNAL: wrong parity" << std::endl;
+        if (d_current_frame_id) {
+            frame_trace::note_equalizer(d_current_frame_id, "wrong_parity");
+        }
         return false;
     }
 
@@ -393,6 +447,9 @@ bool frame_equalizer_impl::parse_signal(uint8_t* decoded_bits)
         break;
     default:
         dout << "unknown encoding" << std::endl;
+        if (d_current_frame_id) {
+            frame_trace::note_equalizer(d_current_frame_id, "unknown_encoding");
+        }
         return false;
     }
 

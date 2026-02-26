@@ -36,6 +36,8 @@ from collections import defaultdict
 import ieee802_11
 import pmt
 
+
+
 # =============================================================================
 # Wireshark manuf (OUI) resolver
 # =============================================================================
@@ -484,9 +486,17 @@ class message_handler(gr.sync_block):
         self.resolver = MacResolver()
         self.verbose = verbose
         self.stats = FrameStats()
+        self.stage_time_ns = defaultdict(int)
+        self.stage_count = defaultdict(int)
+        self.total_msg_time_ns = 0
+        self.total_msg_count = 0
 
         self.message_port_register_in(pmt.intern("in"))
         self.set_msg_handler(pmt.intern("in"), self.handle_msg)
+
+    def _add_stage_time(self, stage: str, dt_ns: int):
+        self.stage_time_ns[stage] += dt_ns
+        self.stage_count[stage] += 1
 
     @staticmethod
     def _meta_get_double(meta, key: str, default: float = 0.0) -> float:
@@ -505,7 +515,9 @@ class message_handler(gr.sync_block):
             return bool(default)
 
     def handle_msg(self, msg):
+        t_msg_start_ns = time.perf_counter_ns()
         try:
+            t0 = time.perf_counter_ns()
             meta = pmt.car(msg)
             frame_bytes = pmt.cdr(msg)
 
@@ -518,22 +530,27 @@ class message_handler(gr.sync_block):
                 self.stats.add_failure("Invalid PMT type")
                 print("CHECKSUM: Checksum FAILED - Invalid PMT type")
                 return
+            self._add_stage_time("pmt_to_bytes", time.perf_counter_ns() - t0)
 
             if len(data) < 2:
                 self.stats.add_failure("Frame too short")
                 print("CHECKSUM: Checksum FAILED - Frame too short")
                 return
 
+            t0 = time.perf_counter_ns()
             # FCS status from decode_mac.cc
             fcs_ok = self._meta_get_bool(meta, "fcs_ok", True)
 
             # Metadata
             snr_db = self._meta_get_double(meta, "snr", 0.0)
             cfo_hz = self._meta_get_double(meta, "frequency offset", 0.0)
+            self._add_stage_time("meta_extract", time.perf_counter_ns() - t0)
 
+            t0 = time.perf_counter_ns()
             # Parse frame control
             fc = struct.unpack_from("<H", data, 0)[0]
             fc_info = parse_frame_control(fc)
+            self._add_stage_time("fc_parse", time.perf_counter_ns() - t0)
 
             if fc_info["version"] != 0:
                 self.stats.add_failure("Invalid 802.11 version")
@@ -543,8 +560,10 @@ class message_handler(gr.sync_block):
             if not DECODE_FRAME_TYPE.get(fc_info["type"], False):
                 return
 
+            t0 = time.perf_counter_ns()
             roles = derive_address_roles(data, fc_info)
             frame_type_str = f"{fc_info['type_name']}/{fc_info['subtype_name']}"
+            self._add_stage_time("address_parse", time.perf_counter_ns() - t0)
 
             # Collect MACs
             macs_in_frame = []
@@ -552,6 +571,7 @@ class message_handler(gr.sync_block):
                 if key in roles and roles[key]:
                     macs_in_frame.append(roles[key])
 
+            t0 = time.perf_counter_ns()
             # Parse SSID if available
             ssid = None
             if fc_info["type"] == 0 and fc_info["subtype"] in (4, 5, 8):
@@ -560,16 +580,19 @@ class message_handler(gr.sync_block):
                     if len(data) > ie_off:
                         ie_info = parse_ies(data[ie_off:])
                         ssid = ie_info.get("ssid")
+            self._add_stage_time("ssid_parse", time.perf_counter_ns() - t0)
 
             self.packet_count += 1
 
             # If FCS failed: count as failure + print FAILED line.
             if not fcs_ok:
                 self.stats.add_failure("FCS")
+                t0 = time.perf_counter_ns()
                 if self.verbose:
                     self._print_frame_summary(data, fc_info, roles, snr_db, cfo_hz, ssid)
                 else:
                     self._print_compact_summary(data, fc_info, roles, snr_db, cfo_hz, ssid)
+                self._add_stage_time("print_summary", time.perf_counter_ns() - t0)
                 print("CHECKSUM: Checksum FAILED - FCS")
                 return
 
@@ -578,14 +601,17 @@ class message_handler(gr.sync_block):
             self.stats.add_success(frame_type_str, ssid=ssid, macs=macs_in_frame, bssid=bssid)
 
             # Print frame summary
+            t0 = time.perf_counter_ns()
             if self.verbose:
                 self._print_frame_summary(data, fc_info, roles, snr_db, cfo_hz, ssid)
             else:
                 self._print_compact_summary(data, fc_info, roles, snr_db, cfo_hz, ssid)
+            self._add_stage_time("print_summary", time.perf_counter_ns() - t0)
 
             print("CHECKSUM: Checksum PASSED")
 
             # Write to PCAP (only good frames)
+            t0 = time.perf_counter_ns()
             self.pcap.write_packet(
                 data,
                 timestamp=time.time(),
@@ -594,6 +620,7 @@ class message_handler(gr.sync_block):
                 noise_dbm=None,
                 antenna=None,
             )
+            self._add_stage_time("pcap_write", time.perf_counter_ns() - t0)
 
         except Exception as e:
             self.stats.add_failure(f"Exception: {str(e)[:50]}")
@@ -601,6 +628,28 @@ class message_handler(gr.sync_block):
             if self.verbose:
                 import traceback
                 traceback.print_exc()
+        finally:
+            self.total_msg_time_ns += time.perf_counter_ns() - t_msg_start_ns
+            self.total_msg_count += 1
+
+    def print_timing_summary(self):
+        print("\n" + "=" * 80)
+        print("HANDLER STAGE TIMING SUMMARY")
+        print("=" * 80)
+        print(f"Total messages: {self.total_msg_count}")
+        print(f"Total handler time: {self.total_msg_time_ns / 1e6:.3f} ms")
+        if self.total_msg_count:
+            print(f"Avg per message: {(self.total_msg_time_ns / self.total_msg_count) / 1e3:.3f} us")
+
+        if self.stage_time_ns:
+            print("\nStage breakdown (sorted by total time):")
+            total = self.total_msg_time_ns if self.total_msg_time_ns > 0 else 1
+            for stage, t_ns in sorted(self.stage_time_ns.items(), key=lambda kv: kv[1], reverse=True):
+                cnt = self.stage_count.get(stage, 0)
+                avg_us = (t_ns / cnt) / 1e3 if cnt else 0.0
+                pct = (100.0 * t_ns) / total
+                print(f"  {stage:14s} total={t_ns / 1e6:9.3f} ms  avg={avg_us:8.3f} us  count={cnt:6d}  {pct:6.2f}%")
+        print("=" * 80)
 
     def _print_frame_summary(self, data, fc_info, roles, snr_db, cfo_hz, ssid):
         print("\n" + "=" * 80)
@@ -776,6 +825,8 @@ def argument_parser():
 
 
 def main(top_block_cls=wifi_rx_file, options=None):
+    file_t0_ns = time.perf_counter_ns()
+    setup_start_ns = file_t0_ns
     if options is None:
         options = argument_parser().parse_args()
 
@@ -798,14 +849,58 @@ def main(top_block_cls=wifi_rx_file, options=None):
         freq_offset=float(options.freq_offset),
         verbose=verbose,
     )
+    setup_done_ns = time.perf_counter_ns()
+    run_start_ns = 0
+    run_end_ns = setup_done_ns
+
+    def print_final_timing():
+        report_start_ns = time.perf_counter_ns()
+        tb.msg_handler.stats.print_summary()
+        tb.msg_handler.print_timing_summary()
+        stats_done_ns = time.perf_counter_ns()
+        tb.pcap.close()
+        close_done_ns = time.perf_counter_ns()
+
+        file_total_ns = close_done_ns - file_t0_ns
+        setup_ns = setup_done_ns - setup_start_ns
+        run_ns = max(0, run_end_ns - run_start_ns)
+        report_ns = stats_done_ns - report_start_ns
+        close_ns = close_done_ns - stats_done_ns
+
+        python_handler_ns = tb.msg_handler.total_msg_time_ns
+        python_non_handler_ns = max(0, report_ns + close_ns)
+        non_python_ns = max(0, file_total_ns - python_handler_ns - python_non_handler_ns)
+        non_python_setup_ns = max(0, setup_ns)
+        non_python_run_residual_ns = max(0, run_ns - python_handler_ns)
+        non_python_unattributed_ns = max(
+            0, non_python_ns - non_python_setup_ns - non_python_run_residual_ns
+        )
+
+        def pct(ns: int) -> float:
+            return (100.0 * ns / file_total_ns) if file_total_ns else 0.0
+
+        print(f"[timing] file_total_ms={file_total_ns / 1e6:.3f}")
+        print(f"[timing] python_total_ms={(python_handler_ns + python_non_handler_ns) / 1e6:.3f}")
+        print(f"[timing] python_handler_ms={python_handler_ns / 1e6:.3f}")
+        print(f"[timing] python_non_handler_ms={python_non_handler_ns / 1e6:.3f}")
+        print(f"[timing] non_python_ms={non_python_ns / 1e6:.3f}")
+        print(f"[timing] non_python_setup_ms={non_python_setup_ns / 1e6:.3f} ({pct(non_python_setup_ns):.2f}%)")
+        print(f"[timing] non_python_run_residual_ms={non_python_run_residual_ns / 1e6:.3f} ({pct(non_python_run_residual_ns):.2f}%)")
+        print(f"[timing] non_python_unattributed_ms={non_python_unattributed_ns / 1e6:.3f} ({pct(non_python_unattributed_ns):.2f}%)")
+        print(f"[timing] phase_setup_ms={setup_ns / 1e6:.3f}")
+        print(f"[timing] phase_run_ms={run_ns / 1e6:.3f}")
+        print(f"[timing] phase_report_ms={report_ns / 1e6:.3f}")
+        print(f"[timing] phase_close_ms={close_ns / 1e6:.3f}")
+        print("[timing] note: cpp_total/cpp_block lines are printed at process exit and belong mostly to non_python_run_residual_ms")
 
     def sig_handler(sig=None, frame=None):
         try:
             tb.stop()
             tb.wait()
         finally:
-            tb.msg_handler.stats.print_summary()
-            tb.pcap.close()
+            nonlocal run_end_ns
+            run_end_ns = time.perf_counter_ns()
+            print_final_timing()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, sig_handler)
@@ -814,12 +909,14 @@ def main(top_block_cls=wifi_rx_file, options=None):
     print("Processing file until EOF (Ctrl-C to stop)...\n")
 
     try:
+        run_start_ns = time.perf_counter_ns()
         tb.run()  # IMPORTANT: run to EOF
+        run_end_ns = time.perf_counter_ns()
     except KeyboardInterrupt:
+        run_end_ns = time.perf_counter_ns()
         pass
 
-    tb.msg_handler.stats.print_summary()
-    tb.pcap.close()
+    print_final_timing()
 
     print()
     print("=" * 80)
@@ -830,4 +927,7 @@ def main(top_block_cls=wifi_rx_file, options=None):
 
 
 if __name__ == "__main__":
+    t0 = time.perf_counter()
     main()
+    dt = time.perf_counter() - t0
+    print(f"Elapsed: {dt:.6f} s")

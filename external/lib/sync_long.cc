@@ -15,6 +15,8 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include "utils.h"
+#include "timing_stats.h"
+#include "frame_trace.h"
 #include <gnuradio/fft/fft.h>
 #include <gnuradio/filter/fir_filter.h>
 #include <gnuradio/io_signature.h>
@@ -23,6 +25,9 @@
 
 #include <list>
 #include <tuple>
+#include <chrono>
+#include <cstdint>
+#include <iostream>
 
 using namespace gr::ieee802_11;
 using namespace std;
@@ -47,6 +52,11 @@ public:
           d_debug(debug),
           d_offset(0),
           d_state(SYNC),
+          d_current_frame_id(0),
+          d_work_calls(0),
+          d_items_in(0),
+          d_items_out(0),
+          d_work_time_ns(0),
           SYNC_LENGTH(sync_length)
     {
 
@@ -55,6 +65,17 @@ public:
     }
 
     ~sync_long_impl() {
+        if (d_work_calls) {
+            timing_stats::add_block_timing(
+                "sync_long", d_work_calls, d_items_in, d_items_out, d_work_time_ns);
+            const double total_ms = static_cast<double>(d_work_time_ns) / 1e6;
+            const double avg_us = static_cast<double>(d_work_time_ns) / d_work_calls / 1e3;
+            std::cout << "[timing] sync_long calls=" << d_work_calls
+                      << " in=" << d_items_in
+                      << " out=" << d_items_out
+                      << " total_ms=" << total_ms
+                      << " avg_us=" << avg_us << std::endl;
+        }
         volk_free(d_correlation);
     }
 
@@ -63,6 +84,7 @@ public:
                      gr_vector_const_void_star& input_items,
                      gr_vector_void_star& output_items)
     {
+        const auto t_start = std::chrono::steady_clock::now();
 
         const gr_complex* in = (const gr_complex*)input_items[0];
         const gr_complex* in_delayed = (const gr_complex*)input_items[1];
@@ -74,7 +96,8 @@ public:
         int ninput = std::min(std::min(ninput_items[0], ninput_items[1]), 8192);
 
         const uint64_t nread = nitems_read(0);
-        get_tags_in_range(d_tags, 0, nread, nread + ninput);
+        get_tags_in_range(
+            d_tags, 0, nread, nread + ninput, pmt::string_to_symbol("wifi_start"));
         if (d_tags.size()) {
             std::sort(d_tags.begin(), d_tags.end(), gr::tag_t::offset_compare);
 
@@ -83,13 +106,30 @@ public:
             if (offset > nread) {
                 ninput = offset - nread;
             } else {
+                uint64_t new_frame_id = 0;
+                std::vector<gr::tag_t> frame_id_tags;
+                get_tags_in_range(frame_id_tags,
+                                  0,
+                                  offset,
+                                  offset + 1,
+                                  pmt::string_to_symbol("frame_id"));
+                if (frame_id_tags.size()) {
+                    new_frame_id = pmt::to_uint64(frame_id_tags.front().value);
+                }
                 if (d_offset && (d_state == SYNC)) {
                     throw std::runtime_error("wtf");
                 }
                 if (d_state == COPY) {
+                    if (d_current_frame_id) {
+                        frame_trace::note_sync_long(d_current_frame_id, "interrupted");
+                    }
                     d_state = RESET;
                 }
                 d_freq_offset_short = pmt::to_double(d_tags.front().value);
+                d_current_frame_id = new_frame_id;
+                if (d_current_frame_id) {
+                    frame_trace::note_sync_long(d_current_frame_id, "tag_received");
+                }
             }
         }
 
@@ -112,6 +152,15 @@ public:
 
                 if (d_offset == SYNC_LENGTH) {
                     search_frame_start();
+                    if (d_current_frame_id) {
+                        if (d_frame_start == SYNC_LENGTH) {
+                            frame_trace::note_sync_long(d_current_frame_id,
+                                                        "fallback_no_peak");
+                        } else {
+                            frame_trace::note_sync_long(d_current_frame_id,
+                                                        "aligned_copy");
+                        }
+                    }
                     mylog("LONG: frame start at {}",d_frame_start);
                     d_offset = 0;
                     d_count = 0;
@@ -134,6 +183,13 @@ public:
                                  pmt::string_to_symbol("wifi_start"),
                                  pmt::from_double(d_freq_offset_short - d_freq_offset),
                                  pmt::string_to_symbol(name()));
+                    if (d_current_frame_id) {
+                        add_item_tag(0,
+                                     nitems_written(0),
+                                     pmt::string_to_symbol("frame_id"),
+                                     pmt::from_uint64(d_current_frame_id),
+                                     pmt::string_to_symbol(name()));
+                    }
                     add_item_tag(0,
                                  nitems_written(0),
                                  pmt::string_to_symbol("cfo_short_rad_per_samp"),
@@ -176,6 +232,12 @@ public:
         dout << "produced : " << o << " consumed: " << i << std::endl;
 
         d_count += o;
+        d_work_calls++;
+        d_items_in += i;
+        d_items_out += o;
+        d_work_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - t_start)
+                              .count();
         consume(0, i);
         consume(1, i);
         return o;
@@ -244,6 +306,7 @@ private:
     int d_count;
     int d_offset;
     int d_frame_start;
+    uint64_t d_current_frame_id;
     float d_freq_offset;
     double d_freq_offset_short;
 
@@ -254,6 +317,10 @@ private:
 
     const bool d_log;
     const bool d_debug;
+    uint64_t d_work_calls;
+    uint64_t d_items_in;
+    uint64_t d_items_out;
+    uint64_t d_work_time_ns;
     const int SYNC_LENGTH;
 
     static const std::vector<gr_complex> LONG;

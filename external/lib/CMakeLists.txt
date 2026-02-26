@@ -31,6 +31,7 @@ list(APPEND ieee802_11_sources
     equalizer/sta.cc
     ether_encap_impl.cc
     extract_csi_impl.cc
+    frame_trace.cc
     frame_equalizer_impl.cc
     mac.cc
     mapper_impl.cc
@@ -38,6 +39,7 @@ list(APPEND ieee802_11_sources
     signal_field_impl.cc
     sync_long.cc
     sync_short.cc
+    timing_stats.cc
     utils.cc
     viterbi_decoder/base.cc
     append_crc32_impl.cc
