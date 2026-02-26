@@ -10,3 +10,4 @@ examples/*.py
 *.pyo
 build*/
 examples/grc/*.py
+external/lib/decode_mac_origin.cc
