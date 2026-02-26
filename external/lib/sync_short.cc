@@ -18,12 +18,40 @@
 #include <gnuradio/io_signature.h>
 #include <ieee802_11/sync_short.h>
 
+#include <fstream>
 #include <iostream>
+#include <string>
 
 using namespace gr::ieee802_11;
 
 static const int MIN_GAP = 480;
 static const int MAX_SAMPLES = 540 * 80;
+
+static void print_loaded_ieee80211_so_once()
+{
+    static bool printed = false;
+    if (printed) {
+        return;
+    }
+    printed = true;
+
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+        if (line.find("libgnuradio-ieee802_11.so") != std::string::npos) {
+            const std::string msg =
+                std::string("[sync_short.cc] loaded SO mapping: ") + line;
+            std::cout << msg << std::endl;
+            std::cerr << msg << std::endl;
+            return;
+        }
+    }
+
+    const std::string msg =
+        "[sync_short.cc] loaded SO mapping: not found in /proc/self/maps";
+    std::cout << msg << std::endl;
+    std::cerr << msg << std::endl;
+}
 
 class sync_short_impl : public sync_short
 {
@@ -45,6 +73,7 @@ public:
     {
 
         set_tag_propagation_policy(block::TPP_DONT);
+        print_loaded_ieee80211_so_once();
     }
 
     int general_work(int noutput_items,

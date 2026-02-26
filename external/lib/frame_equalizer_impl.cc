@@ -48,7 +48,9 @@ frame_equalizer_impl::frame_equalizer_impl(
       d_bw(bw),
       d_frame_bytes(0),
       d_frame_symbols(0),
-      d_freq_offset_from_synclong(0.0)
+      d_freq_offset_from_synclong(0.0),
+      d_cfo_short_from_synclong(0.0),
+      d_cfo_long_from_synclong(0.0)
 {
 
     message_port_register_out(pmt::mp("symbols"));
@@ -142,12 +144,41 @@ int frame_equalizer_impl::general_work(int noutput_items,
             d_frame_symbols = 0;
             d_frame_mod = d_bpsk;
 
-            d_freq_offset_from_synclong =
-                pmt::to_double(tags.front().value) * d_bw / (2 * M_PI);
-            d_epsilon0 = pmt::to_double(tags.front().value) * d_bw / (2 * M_PI * d_freq);
+            const double cfo_diff_rad_per_samp = pmt::to_double(tags.front().value);
+            d_freq_offset_from_synclong = cfo_diff_rad_per_samp * d_bw / (2 * M_PI);
+            d_epsilon0 = cfo_diff_rad_per_samp * d_bw / (2 * M_PI * d_freq);
             d_er = 0;
 
+            std::vector<gr::tag_t> cfo_short_tags;
+            get_tags_in_window(cfo_short_tags,
+                               0,
+                               i,
+                               i + 1,
+                               pmt::string_to_symbol("cfo_short_rad_per_samp"));
+            if (cfo_short_tags.size()) {
+                d_cfo_short_from_synclong =
+                    pmt::to_double(cfo_short_tags.front().value) * d_bw / (2 * M_PI);
+            } else {
+                d_cfo_short_from_synclong = 0.0;
+            }
+
+            std::vector<gr::tag_t> cfo_long_tags;
+            get_tags_in_window(cfo_long_tags,
+                               0,
+                               i,
+                               i + 1,
+                               pmt::string_to_symbol("cfo_long_rad_per_samp"));
+            if (cfo_long_tags.size()) {
+                d_cfo_long_from_synclong =
+                    pmt::to_double(cfo_long_tags.front().value) * d_bw / (2 * M_PI);
+            } else {
+                d_cfo_long_from_synclong = 0.0;
+            }
+
             dout << "epsilon: " << d_epsilon0 << std::endl;
+            dout << "sync CFO [Hz] short: " << d_cfo_short_from_synclong
+                 << " long: " << d_cfo_long_from_synclong
+                 << " diff(short-long): " << d_freq_offset_from_synclong << std::endl;
         }
 
         // not interesting -> skip
@@ -229,6 +260,12 @@ int frame_equalizer_impl::general_work(int noutput_items,
                 dict = pmt::dict_add(dict,
                                      pmt::mp("frequency offset"),
                                      pmt::from_double(d_freq_offset_from_synclong));
+                dict = pmt::dict_add(dict,
+                                     pmt::mp("cfo short"),
+                                     pmt::from_double(d_cfo_short_from_synclong));
+                dict = pmt::dict_add(dict,
+                                     pmt::mp("cfo long"),
+                                     pmt::from_double(d_cfo_long_from_synclong));
                 dict = pmt::dict_add(dict, pmt::mp("beta"), pmt::from_double(beta));
 
                 std::vector<gr_complex> csi = d_equalizer->get_csi();

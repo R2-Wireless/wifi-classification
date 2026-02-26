@@ -39,9 +39,11 @@ public:
           d_debug(debug),
           d_ofdm(BPSK_1_2),
           d_frame(d_ofdm, 0),
+          copied(0),
           d_frame_complete(true)
     {
         message_port_register_out(pmt::mp("out"));
+        message_port_register_out(pmt::mp("out_fail"));
     }
 
     int general_work(int noutput_items,
@@ -60,6 +62,7 @@ public:
         dout << "Decode MAC: input " << ninput_items[0] << std::endl;
 
         while (i < ninput_items[0]) {
+           // dout << "DECODE_MAC_MARKER_20260224" << std::endl;
 
             get_tags_in_range(tags, 0, nread + i, nread + i + 1);
 
@@ -138,13 +141,49 @@ public:
         descramble(decoded);
         print_output();
 
+        // ---- CRC diagnostics: compute CRC over payload (excluding FCS) and compare ----
+        if (d_frame.psdu_size >= 4) {
+            const uint8_t* psdu = out_bytes + 2;
+            const size_t psdu_len = d_frame.psdu_size;
+
+            // Extract FCS bytes at end.
+            const uint8_t* fcs_b = psdu + (psdu_len - 4);
+            uint32_t fcs_le = (uint32_t)fcs_b[0] |
+                              ((uint32_t)fcs_b[1] << 8) |
+                              ((uint32_t)fcs_b[2] << 16) |
+                              ((uint32_t)fcs_b[3] << 24);
+            uint32_t fcs_be = (uint32_t)fcs_b[3] |
+                              ((uint32_t)fcs_b[2] << 8) |
+                              ((uint32_t)fcs_b[1] << 16) |
+                              ((uint32_t)fcs_b[0] << 24);
+
+            // CRC over payload excluding FCS.
+            boost::crc_32_type crc_payload;
+            crc_payload.process_bytes(psdu, psdu_len - 4);
+            uint32_t crc_calc = crc_payload.checksum();
+
+            dout << std::hex;
+            dout << "CRC3222(payllload) ttt calc=0x" << crc_calc
+                 << "  fcs_le=0x" << fcs_le
+                 << "  fcs_be=0x" << fcs_be
+                 << std::dec << std::endl;
+
+            if (crc_calc == fcs_le) {
+                dout << "CRC MATCH (little-endian FCS)" << std::endl;
+            } else if (crc_calc == fcs_be) {
+                dout << "CRC MATCH (big-endian FCS)" << std::endl;
+            } else {
+                dout << "CRC NO MATCH (likely bit errors OR packing issue upstream)"
+                     << std::endl;
+            }
+        }
+        // -------------------------------------------------------------------------------
+
         // skip service field
         boost::crc_32_type result;
         result.process_bytes(out_bytes + 2, d_frame.psdu_size);
-        if (result.checksum() != 558161692) {
-            dout << "checksum wrong -- dropping" << std::endl;
-            return;
-        }
+        const uint32_t residue = result.checksum();
+        const bool fcs_ok = (residue == 0x2144DF1C);
 
         mylog("encoding: {} - length: {} - symbols: {}",
               d_ofdm.encoding,
@@ -155,6 +194,14 @@ public:
         pmt::pmt_t blob = pmt::make_blob(out_bytes + 2, d_frame.psdu_size - 4);
         d_meta =
             pmt::dict_add(d_meta, pmt::mp("dlt"), pmt::from_long(LINKTYPE_IEEE802_11));
+        d_meta = pmt::dict_add(d_meta, pmt::mp("fcs_ok"), pmt::from_bool(fcs_ok));
+        d_meta = pmt::dict_add(d_meta, pmt::mp("fcs_residue"), pmt::from_uint64(residue));
+
+        if (!fcs_ok) {
+            dout << "checksum wrong -- publishing to out_fail" << std::endl;
+            message_port_pub(pmt::mp("out_fail"), pmt::cons(d_meta, blob));
+            return;
+        }
 
         message_port_pub(pmt::mp("out"), pmt::cons(d_meta, blob));
     }

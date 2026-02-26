@@ -90,6 +90,8 @@ class message_handler(gr.sync_block):
             # Extract metadata
             snr = pmt.dict_ref(meta, pmt.intern('snr'), pmt.from_double(0))
             freq_offset = pmt.dict_ref(meta, pmt.intern('frequency offset'), pmt.from_double(0))
+            cfo_short = pmt.dict_ref(meta, pmt.intern('cfo short'), pmt.from_double(0))
+            cfo_long = pmt.dict_ref(meta, pmt.intern('cfo long'), pmt.from_double(0))
             
             # Parse basic MAC info
             if len(data) >= 24:
@@ -110,7 +112,9 @@ class message_handler(gr.sync_block):
                 print(f"[{self.packet_count:3d}] {type_names.get(frame_type, 'Unk'):4} "
                       f"{fmt_mac(addr2)} → {fmt_mac(addr1)}  "
                       f"SNR:{pmt.to_double(snr):5.1f}dB  "
-                      f"Off:{pmt.to_double(freq_offset)/1e3:+6.1f}kHz  "
+                      f"CFOd:{pmt.to_double(freq_offset)/1e3:+6.1f}kHz  "
+                      f"CFOs:{pmt.to_double(cfo_short)/1e3:+6.1f}kHz  "
+                      f"CFOl:{pmt.to_double(cfo_long)/1e3:+6.1f}kHz  "
                       f"{len(data):4d}B")
                 
                 # Write to PCAP

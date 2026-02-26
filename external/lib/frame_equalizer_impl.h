@@ -59,6 +59,8 @@ private:
     // freq offset
     double d_freq;                      // Hz
     double d_freq_offset_from_synclong; // Hz, estimation from "sync_long" block
+    double d_cfo_short_from_synclong;   // Hz, CFO estimate from sync_short
+    double d_cfo_long_from_synclong;    // Hz, CFO estimate from sync_long
     double d_bw;                        // Hz
     double d_er;
     double d_epsilon0;

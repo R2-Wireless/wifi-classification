@@ -4,6 +4,12 @@
 """
 gr-ieee802-11 WiFi Receiver with Enhanced Frame Summary Statistics
 
+VERSION: v15 - FIX sync_short port-0 wiring (2026-02-25)
+- BUGFIX: sync_short port 0 now receives the raw (undelayed) IQ stream.
+  Previously it received the 16-sample delayed stream (blocks_delay_0_0),
+  which shifted every copied frame by 16 samples, misaligned the 64-sample
+  FFT windows, corrupted all decoded bits, and caused 0% FCS pass rate.
+
 VERSION: v14 - CONSTELLATION/MODULATION DETECTION (2026-02-08)
 - NEW: Added constellation/modulation detection (BPSK, QPSK, 16-QAM, 64-QAM)
 - Displays constellation in both verbose and compact output modes
@@ -713,15 +719,20 @@ class wifi_rx_file(gr.top_block):
         self.connect((src, 0), (self.blocks_multiply_xx_0, 0))
 
         self.connect((self.blocks_delay_0_0, 0), (self.blocks_conjugate_cc_0, 0))
-        self.connect((self.blocks_delay_0_0, 0), (self.ieee802_11_sync_short_0, 0))
+        # FIX: sync_short port 0 must receive the RAW (undelayed) signal so that
+        # the CFO-corrected copy in COPY state uses correctly-timed samples.
+        # Previously this was (blocks_delay_0_0, 0) which fed the 16-sample delayed
+        # signal → shifted every frame by 16 samples → FFT symbol boundaries wrong
+        # → Viterbi decoding garbage → FCS always failed.
+        self.connect((src, 0),                    (self.ieee802_11_sync_short_0, 0))  # port 0: raw IQ
         self.connect((self.blocks_conjugate_cc_0, 0), (self.blocks_multiply_xx_0, 1))
         self.connect((self.blocks_multiply_xx_0, 0), (self.blocks_moving_average_xx_1, 0))
         self.connect((self.blocks_moving_average_xx_1, 0), (self.blocks_complex_to_mag_0, 0))
-        self.connect((self.blocks_moving_average_xx_1, 0), (self.ieee802_11_sync_short_0, 1))
+        self.connect((self.blocks_moving_average_xx_1, 0), (self.ieee802_11_sync_short_0, 1))  # port 1: complex MA (for CFO phase)
         self.connect((self.blocks_complex_to_mag_0, 0), (self.blocks_divide_xx_0, 0))
         self.connect((self.blocks_complex_to_mag_squared_0, 0), (self.blocks_moving_average_xx_0, 0))
         self.connect((self.blocks_moving_average_xx_0, 0), (self.blocks_divide_xx_0, 1))
-        self.connect((self.blocks_divide_xx_0, 0), (self.ieee802_11_sync_short_0, 2))
+        self.connect((self.blocks_divide_xx_0, 0), (self.ieee802_11_sync_short_0, 2))  # port 2: normalized correlation float
 
         self.connect((self.ieee802_11_sync_short_0, 0), (self.blocks_delay_0, 0))
         self.connect((self.ieee802_11_sync_short_0, 0), (self.ieee802_11_sync_long_0, 0))
@@ -808,4 +819,3 @@ def main(top_block_cls=wifi_rx_file, options=None):
 
 if __name__ == "__main__":
     main()
-
