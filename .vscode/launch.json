@@ -39,7 +39,7 @@
       "request": "launch",
       "program": "${workspaceFolder}/main_script_14.py",
       "args": [
-        "/mnt/c/Users/Public/Documents/Wify/Py_script/cfiles/Neo2_19_02/Neo2-Wifi-5180MHz-02-19-26-15h57m06s639_0001_20mhz_SNR_Both_dB.cfile",
+        "/mnt/c/Users/Public/Documents/Wify/Py_script/cfiles/First batch/Anafi-AI-R21_0044_20mhz_SNR_300_dB.cfile",
         "/tmp/debug_output.pcap"
       ],
       "env": {
@@ -57,7 +57,7 @@
       "request": "launch",
       "program": "${workspaceFolder}/main_script_14.py",
       "args": [
-        "/mnt/c/Users/Public/Documents/Wify/Py_script/cfiles/Neo2_19_02/Neo2-Wifi-5180MHz-02-19-26-15h57m06s639_0001_20mhz_SNR_Both_dB.cfile",
+        "/mnt/c/Users/Public/Documents/Wify/Py_script/cfiles/First batch/Anafi-AI-R21_0044_20mhz_SNR_300_dB.cfile",
         "/tmp/debug_output.pcap"
       ],
       "env": {
@@ -73,7 +73,7 @@
       "request": "launch",
       "program": "${workspaceFolder}/main_script_14.py",
       "args": [
-        "/mnt/c/Users/Public/Documents/Wify/Py_script/cfiles/Neo2_19_02/Neo2-Wifi-5180MHz-02-19-26-15h57m06s639_0001_20mhz_SNR_Both_dB.cfile",
+        "/mnt/c/Users/Public/Documents/Wify/Py_script/cfiles/First batch/Anafi-AI-R21_0044_20mhz_SNR_300_dB.cfile",
         "/tmp/debug_output.pcap",
         "--compact"
       ],
@@ -90,7 +90,7 @@
       "request": "launch",
       "program": "${workspaceFolder}/main_script_14.py",
       "args": [
-        "/mnt/c/Users/Public/Documents/Wify/Py_script/cfiles/Neo2_19_02/Neo2-Wifi-5180MHz-02-19-26-15h57m06s639_0001_20mhz_SNR_Both_dB.cfile",
+        "/mnt/c/Users/Public/Documents/Wify/Py_script/cfiles/First batch/Anafi-AI-R21_0044_20mhz_SNR_300_dB.cfile",
         "/tmp/debug_output.pcap",
         "--freq-offset",
         "0"
