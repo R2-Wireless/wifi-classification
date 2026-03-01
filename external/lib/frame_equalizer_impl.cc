@@ -82,13 +82,6 @@ frame_equalizer_impl::~frame_equalizer_impl()
     }
     timing_stats::add_block_timing(
         "frame_equalizer", d_work_calls, d_items_in, d_items_out, d_work_time_ns);
-    const double total_ms = static_cast<double>(d_work_time_ns) / 1e6;
-    const double avg_us = static_cast<double>(d_work_time_ns) / d_work_calls / 1e3;
-    std::cout << "[timing] frame_equalizer calls=" << d_work_calls
-              << " in=" << d_items_in
-              << " out=" << d_items_out
-              << " total_ms=" << total_ms
-              << " avg_us=" << avg_us << std::endl;
 }
 
 

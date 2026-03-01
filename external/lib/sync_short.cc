@@ -25,6 +25,8 @@
 #include <string>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 using namespace gr::ieee802_11;
 
@@ -92,13 +94,6 @@ public:
         }
         timing_stats::add_block_timing(
             "sync_short", d_work_calls, d_items_in, d_items_out, d_work_time_ns);
-        const double total_ms = static_cast<double>(d_work_time_ns) / 1e6;
-        const double avg_us = static_cast<double>(d_work_time_ns) / d_work_calls / 1e3;
-        std::cout << "[timing] sync_short calls=" << d_work_calls
-                  << " in=" << d_items_in
-                  << " out=" << d_items_out
-                  << " total_ms=" << total_ms
-                  << " avg_us=" << avg_us << std::endl;
     }
 
     int general_work(int noutput_items,
@@ -125,6 +120,33 @@ public:
         int noutput = noutput_items;
         int ninput =
             std::min(std::min(ninput_items[0], ninput_items[1]), ninput_items[2]);
+
+        // Optional correlation dump for offline plotting (e.g., MATLAB).
+        // Enable with: WIFI_DUMP_CORR=1
+        static bool dump_init = false;
+        static bool dump_enabled = false;
+        static FILE* fp_short = nullptr;
+        static FILE* fp_abs = nullptr;
+        if (!dump_init) {
+            dump_init = true;
+            dump_enabled = (std::getenv("WIFI_DUMP_CORR") != nullptr);
+            if (dump_enabled) {
+                const char* short_path = std::getenv("WIFI_DUMP_SHORT_COR_PATH");
+                const char* abs_path = std::getenv("WIFI_DUMP_SHORT_ABS_PATH");
+                fp_short = std::fopen(short_path ? short_path : "/tmp/sync_short_cor.bin", "wb");
+                fp_abs = std::fopen(abs_path ? abs_path : "/tmp/sync_short_abs.bin", "wb");
+            }
+        }
+        if (dump_enabled && ninput > 0) {
+            if (fp_short) {
+                std::fwrite(in_cor, sizeof(float), ninput, fp_short);
+                std::fflush(fp_short);
+            }
+            if (fp_abs) {
+                std::fwrite(in_abs, sizeof(gr_complex), ninput, fp_abs);
+                std::fflush(fp_abs);
+            }
+        }
 
         // dout << "SHORT noutput : " << noutput << " ninput: " << ninput_items[0] <<
         // std::endl;
@@ -203,6 +225,25 @@ public:
     void insert_tag(uint64_t item, double freq_offset, uint64_t input_item)
     {
         mylog("frame start at in: {} out: {}", item, input_item);
+        // Optional detection index dump (absolute input sample index).
+        // Enable with: WIFI_DUMP_CORR=1
+        static bool dump_init = false;
+        static bool dump_enabled = false;
+        static FILE* fp_det = nullptr;
+        if (!dump_init) {
+            dump_init = true;
+            dump_enabled = (std::getenv("WIFI_DUMP_CORR") != nullptr);
+            if (dump_enabled) {
+                const char* det_path = std::getenv("WIFI_DUMP_SHORT_DET_PATH");
+                fp_det = std::fopen(det_path ? det_path : "/tmp/sync_short_det.bin", "wb");
+            }
+        }
+        if (dump_enabled && fp_det) {
+            const uint64_t idx = input_item;
+            std::fwrite(&idx, sizeof(uint64_t), 1, fp_det);
+            std::fflush(fp_det);
+        }
+
         const uint64_t frame_id = d_next_frame_id++;
         frame_trace::note_sync_short(frame_id, "detected");
 

@@ -28,6 +28,8 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <cstdio>
+#include <cstdlib>
 
 using namespace gr::ieee802_11;
 using namespace std;
@@ -68,13 +70,6 @@ public:
         if (d_work_calls) {
             timing_stats::add_block_timing(
                 "sync_long", d_work_calls, d_items_in, d_items_out, d_work_time_ns);
-            const double total_ms = static_cast<double>(d_work_time_ns) / 1e6;
-            const double avg_us = static_cast<double>(d_work_time_ns) / d_work_calls / 1e3;
-            std::cout << "[timing] sync_long calls=" << d_work_calls
-                      << " in=" << d_items_in
-                      << " out=" << d_items_out
-                      << " total_ms=" << total_ms
-                      << " avg_us=" << avg_us << std::endl;
         }
         volk_free(d_correlation);
     }
@@ -94,6 +89,30 @@ public:
              << "  noutput " << noutput << "   state " << d_state << std::endl;
 
         int ninput = std::min(std::min(ninput_items[0], ninput_items[1]), 8192);
+
+        // Optional long-correlation and detection dumps for offline plotting.
+        // Enable with: WIFI_DUMP_CORR=1
+        static bool dump_init = false;
+        static bool dump_enabled = false;
+        static FILE* fp_long_mag = nullptr;
+        static FILE* fp_long_cplx = nullptr;
+        static FILE* fp_long_det = nullptr;
+        static uint64_t long_corr_counter = 0; // count of dumped correlation samples
+        if (!dump_init) {
+            dump_init = true;
+            dump_enabled = (std::getenv("WIFI_DUMP_CORR") != nullptr);
+            if (dump_enabled) {
+                const char* mag_path = std::getenv("WIFI_DUMP_LONG_MAG_PATH");
+                const char* cplx_path = std::getenv("WIFI_DUMP_LONG_CPLX_PATH");
+                const char* det_path = std::getenv("WIFI_DUMP_LONG_DET_PATH");
+                fp_long_mag =
+                    std::fopen(mag_path ? mag_path : "/tmp/sync_long_cor_mag.bin", "wb");
+                fp_long_cplx =
+                    std::fopen(cplx_path ? cplx_path : "/tmp/sync_long_cor_cplx.bin", "wb");
+                fp_long_det =
+                    std::fopen(det_path ? det_path : "/tmp/sync_long_det.bin", "wb");
+            }
+        }
 
         const uint64_t nread = nitems_read(0);
         get_tags_in_range(
@@ -140,12 +159,24 @@ public:
         switch (d_state) {
 
         case SYNC:
-            d_fir.filterN(
-                d_correlation, in, std::min(SYNC_LENGTH, std::max(ninput - 63, 0)));
+            {
+                const int n_computed = std::min(SYNC_LENGTH, std::max(ninput - 63, 0));
+                d_fir.filterN(d_correlation, in, n_computed);
+            }
 
             while (i + 63 < ninput) {
 
                 d_cor.push_back(pair<gr_complex, int>(d_correlation[i], d_offset));
+                if (dump_enabled) {
+                    if (fp_long_mag) {
+                        const float mag = std::abs(d_correlation[i]);
+                        std::fwrite(&mag, sizeof(float), 1, fp_long_mag);
+                    }
+                    if (fp_long_cplx) {
+                        std::fwrite(&d_correlation[i], sizeof(gr_complex), 1, fp_long_cplx);
+                    }
+                }
+                long_corr_counter++;
 
                 i++;
                 d_offset++;
@@ -161,12 +192,30 @@ public:
                                                         "aligned_copy");
                         }
                     }
+                    if (dump_enabled && fp_long_det && d_frame_start != SYNC_LENGTH) {
+                        const uint64_t peak1 =
+                            (long_corr_counter >= SYNC_LENGTH)
+                                ? (long_corr_counter - SYNC_LENGTH + d_frame_start)
+                                : d_frame_start;
+                        const uint64_t peak2 = peak1 + 64;
+                        std::fwrite(&peak1, sizeof(uint64_t), 1, fp_long_det);
+                        std::fwrite(&peak2, sizeof(uint64_t), 1, fp_long_det);
+                        std::fflush(fp_long_det);
+                    }
                     mylog("LONG: frame start at {}",d_frame_start);
                     d_offset = 0;
                     d_count = 0;
                     d_state = COPY;
 
                     break;
+                }
+            }
+            if (dump_enabled) {
+                if (fp_long_mag) {
+                    std::fflush(fp_long_mag);
+                }
+                if (fp_long_cplx) {
+                    std::fflush(fp_long_cplx);
                 }
             }
 

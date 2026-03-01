@@ -25,6 +25,7 @@ v11 UPDATED:
 
 from gnuradio import blocks, fft, gr
 from gnuradio.fft import window
+import os
 import sys
 import signal
 import struct
@@ -821,7 +822,154 @@ def argument_parser():
                         help="Coarse frequency offset correction in Hz")
     parser.add_argument("--compact", action="store_true",
                         help="Use compact one-line output instead of verbose summaries")
+    parser.add_argument("--gr-perf", action="store_true",
+                        help="Enable GNU Radio built-in performance counters (pc_*) and print per-stage timing tables")
     return parser
+
+
+def _collect_gr_block_perf_rows(tb):
+    rows = []
+    seen = set()
+    for var_name, obj in tb.__dict__.items():
+        if id(obj) in seen:
+            continue
+        if not hasattr(obj, "pc_work_time_total"):
+            continue
+        seen.add(id(obj))
+        try:
+            total_ns = float(obj.pc_work_time_total())
+            avg_ns = float(obj.pc_work_time_avg()) if hasattr(obj, "pc_work_time_avg") else 0.0
+            thr_avg = float(obj.pc_throughput_avg()) if hasattr(obj, "pc_throughput_avg") else 0.0
+            nprod_avg = float(obj.pc_nproduced_avg()) if hasattr(obj, "pc_nproduced_avg") else 0.0
+            rows.append({
+                "name": var_name,
+                "total_ns": total_ns,
+                "avg_ns": avg_ns,
+                "throughput_avg": thr_avg,
+                "nproduced_avg": nprod_avg,
+            })
+        except Exception:
+            continue
+    rows.sort(key=lambda r: r["total_ns"], reverse=True)
+    return rows
+
+
+def _collect_stage_totals_from_gr_rows(rows):
+    stage_totals_ns = defaultdict(float)
+    for r in rows:
+        stage_totals_ns[_stage_for_block_name(r["name"])] += r["total_ns"]
+    for s in ("sync_short", "sync_long", "frame_equalizer", "decode_mac", "support"):
+        stage_totals_ns.setdefault(s, 0.0)
+    return stage_totals_ns
+
+
+def _export_stage_weights_env(tb):
+    rows = _collect_gr_block_perf_rows(tb)
+    if not rows:
+        return
+    stage_totals_ns = _collect_stage_totals_from_gr_rows(rows)
+    total_ns = sum(stage_totals_ns.values())
+    if total_ns <= 0.0:
+        return
+    os.environ["WIFI_STAGE_WEIGHT_SYNC_SHORT"] = f"{stage_totals_ns['sync_short'] / total_ns:.12f}"
+    os.environ["WIFI_STAGE_WEIGHT_SYNC_LONG"] = f"{stage_totals_ns['sync_long'] / total_ns:.12f}"
+    os.environ["WIFI_STAGE_WEIGHT_FRAME_EQUALIZER"] = f"{stage_totals_ns['frame_equalizer'] / total_ns:.12f}"
+    os.environ["WIFI_STAGE_WEIGHT_DECODE_MAC"] = f"{stage_totals_ns['decode_mac'] / total_ns:.12f}"
+    os.environ["WIFI_STAGE_WEIGHT_SUPPORT"] = f"{stage_totals_ns['support'] / total_ns:.12f}"
+
+
+def _stage_for_block_name(name: str) -> str:
+    if name in ("blocks_file_source_0", "blocks_multiply_const", "blocks_throttle_0", "blocks_rotator"):
+        return "support"
+    if name in (
+        "blocks_delay_0_0", "blocks_conjugate_cc_0", "blocks_multiply_xx_0",
+        "blocks_moving_average_xx_1", "blocks_complex_to_mag_0",
+        "blocks_complex_to_mag_squared_0", "blocks_moving_average_xx_0",
+        "blocks_divide_xx_0", "ieee802_11_sync_short_0"
+    ):
+        return "sync_short"
+    if name in ("blocks_delay_0", "ieee802_11_sync_long_0"):
+        return "sync_long"
+    if name in ("blocks_stream_to_vector_0", "fft_vxx_0", "ieee802_11_frame_equalizer_0"):
+        return "frame_equalizer"
+    if name in ("ieee802_11_decode_mac_0",):
+        return "decode_mac"
+    return "support"
+
+
+def _print_gr_stage_perf_tables(tb, file_total_ns: int, run_ns: int, run_non_handler_ns: int):
+    rows = _collect_gr_block_perf_rows(tb)
+    if not rows:
+        print("\n[timing] GNU Radio perf counters unavailable (no pc_* rows found).")
+        return
+
+    total_ns = sum(r["total_ns"] for r in rows)
+    if total_ns <= 0.0:
+        print("\n[timing] GNU Radio perf counters returned zero time. Enable with --gr-perf.")
+        return
+
+    file_total_us = file_total_ns / 1e3 if file_total_ns > 0 else 0.0
+    run_total_us = run_ns / 1e3 if run_ns > 0 else 0.0
+
+    stage_totals_ns = _collect_stage_totals_from_gr_rows(rows)
+    stage_order = ["sync_short", "sync_long", "frame_equalizer", "decode_mac", "support"]
+
+    run_non_handler_us = max(0.0, run_non_handler_ns / 1e3)
+    run_unattributed_us = max(0.0, run_non_handler_us - (total_ns / 1e3))
+
+    # Expand run_non_handler unattributed time per stage by proportional allocation.
+    alloc_base_ns = sum(stage_totals_ns[s] for s in stage_order if s != "support")
+    stage_alloc_us = {}
+    if run_unattributed_us > 0.0 and alloc_base_ns > 0.0:
+        for s in stage_order:
+            if s == "support":
+                stage_alloc_us[s] = 0.0
+            else:
+                stage_alloc_us[s] = run_unattributed_us * (stage_totals_ns[s] / alloc_base_ns)
+    else:
+        for s in stage_order:
+            stage_alloc_us[s] = 0.0
+        stage_alloc_us["support"] = run_unattributed_us
+
+    print("\n[timing] Failure-Map Stage Runtime (aligned labels)")
+    print("[timing] +----------------+------------+------------+------------+----------+")
+    print("[timing] | stage          | measured_ms| unattrib_ms| est_total_ms| %run_non |")
+    print("[timing] +----------------+------------+------------+------------+----------+")
+    est_sum_us = 0.0
+    for stage in stage_order:
+        measured_us = stage_totals_ns[stage] / 1e3
+        unattributed_us = stage_alloc_us[stage]
+        est_us = measured_us + unattributed_us
+        est_sum_us += est_us
+        pct_run_non = (100.0 * est_us / run_non_handler_us) if run_non_handler_us else 0.0
+        print(
+            f"[timing] | {stage:<14} | {measured_us / 1e3:10.3f} | {unattributed_us / 1e3:10.3f} | "
+            f"{est_us / 1e3:10.3f} | {pct_run_non:7.2f}% |"
+        )
+    print("[timing] +----------------+------------+------------+------------+----------+")
+    print(
+        f"[timing] | {'run_non_handler':<14} | {(total_ns / 1e6):10.3f} | {run_unattributed_us / 1e3:10.3f} | "
+        f"{est_sum_us / 1e3:10.3f} | {100.00:7.2f}% |"
+    )
+    print("[timing] +----------------+------------+------------+------------+----------+")
+    if run_total_us > 0:
+        print(f"[timing] run_non_handler_as_pct_of_run={100.0 * run_non_handler_us / run_total_us:.2f}%")
+    if file_total_us > 0:
+        print(f"[timing] run_non_handler_as_pct_of_file={100.0 * run_non_handler_us / file_total_us:.2f}%")
+    print("[timing] note: unattrib_ms is allocated proportionally across failure-map stages.")
+
+    print("\n[timing] Top GNU Radio Blocks by Work Time")
+    print("[timing] +------------------------------+------------+----------+----------+----------+")
+    print("[timing] | block                        |    ms      |  %gr_cpu |  avg_us  | nprodavg |")
+    print("[timing] +------------------------------+------------+----------+----------+----------+")
+    for r in rows[:20]:
+        ms = r["total_ns"] / 1e6
+        pct_gr = (100.0 * r["total_ns"] / total_ns) if total_ns else 0.0
+        print(
+            f"[timing] | {r['name']:<28} | {ms:10.3f} | {pct_gr:7.2f}% | "
+            f"{(r['avg_ns'] / 1e3):8.3f} | {r['nproduced_avg']:8.1f} |"
+        )
+    print("[timing] +------------------------------+------------+----------+----------+----------+")
 
 
 def main(top_block_cls=wifi_rx_file, options=None):
@@ -831,6 +979,11 @@ def main(top_block_cls=wifi_rx_file, options=None):
         options = argument_parser().parse_args()
 
     verbose = not options.compact
+    if options.gr_perf:
+        # Must be set before blocks are instantiated.
+        prefs = gr.prefs().singleton()
+        prefs.set_bool("PerfCounters", "on", True)
+        prefs.set_bool("PerfCounters", "export", False)
 
     print("=" * 80)
     print("gr-ieee802-11 WiFi Receiver v14 - Constellation Detection")
@@ -840,6 +993,7 @@ def main(top_block_cls=wifi_rx_file, options=None):
     print(f"Mode:   {'Verbose' if verbose else 'Compact'}")
     if options.freq_offset != 0.0:
         print(f"Freq offset correction: {options.freq_offset} Hz")
+    print(f"GNU Radio perf counters: {'ON' if options.gr_perf else 'OFF'}")
     print("=" * 80)
     print()
 
@@ -856,7 +1010,6 @@ def main(top_block_cls=wifi_rx_file, options=None):
     def print_final_timing():
         report_start_ns = time.perf_counter_ns()
         tb.msg_handler.stats.print_summary()
-        tb.msg_handler.print_timing_summary()
         stats_done_ns = time.perf_counter_ns()
         tb.pcap.close()
         close_done_ns = time.perf_counter_ns()
@@ -870,11 +1023,19 @@ def main(top_block_cls=wifi_rx_file, options=None):
         python_handler_ns = tb.msg_handler.total_msg_time_ns
         python_non_handler_ns = max(0, report_ns + close_ns)
         non_python_ns = max(0, file_total_ns - python_handler_ns - python_non_handler_ns)
+        run_non_handler_ns = max(0, run_ns - python_handler_ns)
         non_python_setup_ns = max(0, setup_ns)
         non_python_run_residual_ns = max(0, run_ns - python_handler_ns)
         non_python_unattributed_ns = max(
             0, non_python_ns - non_python_setup_ns - non_python_run_residual_ns
         )
+
+        # Export totals for C++ atexit timing summary (% of file total).
+        os.environ["WIFI_FILE_TOTAL_NS"] = str(file_total_ns)
+        os.environ["WIFI_PY_HANDLER_NS"] = str(python_handler_ns)
+        os.environ["WIFI_RUN_NON_HANDLER_NS"] = str(run_non_handler_ns)
+        if options.gr_perf:
+            _export_stage_weights_env(tb)
 
         def pct(ns: int) -> float:
             return (100.0 * ns / file_total_ns) if file_total_ns else 0.0
@@ -892,6 +1053,59 @@ def main(top_block_cls=wifi_rx_file, options=None):
         print(f"[timing] phase_report_ms={report_ns / 1e6:.3f}")
         print(f"[timing] phase_close_ms={close_ns / 1e6:.3f}")
         print("[timing] note: cpp_total/cpp_block lines are printed at process exit and belong mostly to non_python_run_residual_ms")
+
+        # Additive breakdown: sums exactly (up to rounding) to file_total.
+        additive_rows = [
+            ("setup", setup_ns),
+            ("python_handler", python_handler_ns),
+            ("run_non_handler", run_non_handler_ns),
+            ("report", report_ns),
+            ("close", close_ns),
+        ]
+        print("\n[timing] Additive Runtime Breakdown (sums to total)")
+        print("[timing] +-------------------+------------+----------+")
+        print("[timing] | component         |    ms      |   pct    |")
+        print("[timing] +-------------------+------------+----------+")
+        for name, ns in additive_rows:
+            ms = ns / 1e6
+            p = (100.0 * ns / file_total_ns) if file_total_ns else 0.0
+            print(f"[timing] | {name:<17} | {ms:10.3f} | {p:7.2f}% |")
+        additive_sum_ns = sum(ns for _, ns in additive_rows)
+        sum_ms = additive_sum_ns / 1e6
+        sum_pct = (100.0 * additive_sum_ns / file_total_ns) if file_total_ns else 0.0
+        print("[timing] +-------------------+------------+----------+")
+        print(f"[timing] | {'SUM':<17} | {sum_ms:10.3f} | {sum_pct:7.2f}% |")
+        print("[timing] +-------------------+------------+----------+")
+
+        # Top Python stage functions within handler path.
+        if tb.msg_handler.stage_time_ns:
+            print("\n[timing] Top Python Handler Functions")
+            print("[timing] +-------------------+------------+----------+----------+")
+            print("[timing] | function          |    ms      | %handler |  %total  |")
+            print("[timing] +-------------------+------------+----------+----------+")
+            sorted_stages = sorted(tb.msg_handler.stage_time_ns.items(),
+                                   key=lambda kv: kv[1],
+                                   reverse=True)
+            stage_sum_ns = 0
+            for stage, t_ns in sorted_stages:
+                stage_sum_ns += t_ns
+                ms = t_ns / 1e6
+                pct_handler = (100.0 * t_ns / python_handler_ns) if python_handler_ns else 0.0
+                pct_total = (100.0 * t_ns / file_total_ns) if file_total_ns else 0.0
+                print(f"[timing] | {stage:<17} | {ms:10.3f} | {pct_handler:7.2f}% | {pct_total:7.2f}% |")
+            stage_sum_ms = stage_sum_ns / 1e6
+            stage_sum_pct = (100.0 * stage_sum_ns / file_total_ns) if file_total_ns else 0.0
+            print("[timing] +-------------------+------------+----------+----------+")
+            print(f"[timing] | {'handler_stage_sum':<17} | {stage_sum_ms:10.3f} | {100.00:7.2f}% | {stage_sum_pct:7.2f}% |")
+            print("[timing] +-------------------+------------+----------+----------+")
+
+        if options.gr_perf:
+            _print_gr_stage_perf_tables(
+                tb,
+                file_total_ns=file_total_ns,
+                run_ns=run_ns,
+                run_non_handler_ns=run_non_handler_ns,
+            )
 
     def sig_handler(sig=None, frame=None):
         try:

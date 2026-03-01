@@ -59,19 +59,12 @@ public:
 
     ~decode_mac_impl()
     {
-        if (!d_work_calls) {
-            return;
-        }
-        timing_stats::add_block_timing(
-            "decode_mac", d_work_calls, d_items_in, d_items_out, d_work_time_ns);
-        const double total_ms = static_cast<double>(d_work_time_ns) / 1e6;
-        const double avg_us = static_cast<double>(d_work_time_ns) / d_work_calls / 1e3;
-        std::cout << "[timing] decode_mac calls=" << d_work_calls
-                  << " in=" << d_items_in
-                  << " out=" << d_items_out
-                  << " total_ms=" << total_ms
-                  << " avg_us=" << avg_us << std::endl;
+    if (!d_work_calls) {
+        return;
     }
+    timing_stats::add_block_timing(
+        "decode_mac", d_work_calls, d_items_in, d_items_out, d_work_time_ns);
+}
 
     int general_work(int noutput_items,
                      gr_vector_int& ninput_items,
