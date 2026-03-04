@@ -148,9 +148,6 @@ int frame_equalizer_impl::general_work(int noutput_items,
     gr_complex symbols[48];
     gr_complex current_symbol[64];
 
-    dout << "FRAME EQUALIZER: input " << ninput_items[0] << "  output " << noutput_items
-         << std::endl;
-
     while ((i < ninput_items[0]) && (o < noutput_items)) {
 
         get_tags_in_window(tags, 0, i, i + 1, pmt::string_to_symbol("wifi_start"));

@@ -33,6 +33,8 @@ using namespace gr::ieee802_11;
 static const int MIN_GAP = 480;
 static const int MAX_SAMPLES = 540 * 80;
 
+enum SyncShortStateId : uint8_t { STATE_SEARCH = 0, STATE_COPY = 1 };
+
 static void print_loaded_ieee80211_so_once()
 {
     static bool printed = false;
@@ -74,6 +76,8 @@ public:
           d_plateau(0),
           d_freq_offset(0),
           d_copied(0),
+          d_copy_region_open(false),
+          d_copy_region_start_input(0),
           d_next_frame_id(1),
           d_work_calls(0),
           d_items_in(0),
@@ -137,17 +141,6 @@ public:
                 fp_abs = std::fopen(abs_path ? abs_path : "/tmp/sync_short_abs.bin", "wb");
             }
         }
-        if (dump_enabled && ninput > 0) {
-            if (fp_short) {
-                std::fwrite(in_cor, sizeof(float), ninput, fp_short);
-                std::fflush(fp_short);
-            }
-            if (fp_abs) {
-                std::fwrite(in_abs, sizeof(gr_complex), ninput, fp_abs);
-                std::fflush(fp_abs);
-            }
-        }
-
         // dout << "SHORT noutput : " << noutput << " ninput: " << ninput_items[0] <<
         // std::endl;
 
@@ -164,14 +157,32 @@ public:
                     } else {
                         d_state = COPY;
                         d_copied = 0;
+                        d_copy_region_open = true;
+                        d_copy_region_start_input = nitems_read(0) + i;
                         d_freq_offset = arg(in_abs[i]) / 16;
                         d_plateau = 0;
-                        insert_tag(nitems_written(0), d_freq_offset, nitems_read(0) + i);
+                        insert_tag(nitems_written(0),
+                                   d_freq_offset,
+                                   nitems_read(0) + i,
+                                   in_cor[i],
+                                   STATE_SEARCH,
+                                   d_copied);
                         dout << "SHORT Frame!" << std::endl;
                         break;
                     }
                 } else {
                     d_plateau = 0;
+                }
+            }
+
+            if (dump_enabled && i > 0) {
+                if (fp_short) {
+                    std::fwrite(in_cor, sizeof(float), i, fp_short);
+                    std::fflush(fp_short);
+                }
+                if (fp_abs) {
+                    std::fwrite(in_abs, sizeof(gr_complex), i, fp_abs);
+                    std::fflush(fp_abs);
                 }
             }
 
@@ -189,11 +200,34 @@ public:
 
                         // there's another frame
                     } else if (d_copied > MIN_GAP) {
+                        std::fprintf(stderr,
+                                     "[sync_short][retrigger] in_idx=%llu copied=%d "
+                                     "metric=%.6f thr=%.6f plateau=%d start=%llu\n",
+                                     static_cast<unsigned long long>(nitems_read(0) + o),
+                                     d_copied,
+                                     static_cast<double>(in_cor[o]),
+                                     d_threshold,
+                                     d_plateau,
+                                     static_cast<unsigned long long>(d_copy_region_start_input));
+                        if (d_copy_region_open) {
+                            dump_copy_region(d_copy_region_start_input, nitems_read(0) + o);
+                            d_copy_region_open = false;
+                        }
+                        d_copy_region_open = true;
+                        d_copy_region_start_input = nitems_read(0) + o;
+
+                        const uint32_t copied_before_retrigger =
+                            static_cast<uint32_t>(d_copied);
                         d_copied = 0;
                         d_plateau = 0;
                         d_freq_offset = arg(in_abs[o]) / 16;
                         insert_tag(
-                            nitems_written(0) + o, d_freq_offset, nitems_read(0) + o);
+                            nitems_written(0) + o,
+                            d_freq_offset,
+                            nitems_read(0) + o,
+                            in_cor[o],
+                            STATE_COPY,
+                            copied_before_retrigger);
                         dout << "SHORT Frame!" << std::endl;
                         break;
                     }
@@ -208,10 +242,25 @@ public:
             }
 
             if (d_copied == MAX_SAMPLES) {
+                if (d_copy_region_open) {
+                    dump_copy_region(d_copy_region_start_input, nitems_read(0) + o);
+                    d_copy_region_open = false;
+                }
                 d_state = SEARCH;
             }
 
             dout << "SHORT copied " << o << std::endl;
+
+            if (dump_enabled && o > 0) {
+                if (fp_short) {
+                    std::fwrite(in_cor, sizeof(float), o, fp_short);
+                    std::fflush(fp_short);
+                }
+                if (fp_abs) {
+                    std::fwrite(in_abs, sizeof(gr_complex), o, fp_abs);
+                    std::fflush(fp_abs);
+                }
+            }
 
             consume_each(o);
             return finish(o, o);
@@ -222,7 +271,12 @@ public:
         return 0;
     }
 
-    void insert_tag(uint64_t item, double freq_offset, uint64_t input_item)
+    void insert_tag(uint64_t item,
+                    double freq_offset,
+                    uint64_t input_item,
+                    float cor_metric,
+                    uint8_t state_id,
+                    uint32_t copied_in_state)
     {
         mylog("frame start at in: {} out: {}", item, input_item);
         // Optional detection index dump (absolute input sample index).
@@ -244,6 +298,32 @@ public:
             std::fflush(fp_det);
         }
 
+        // Optional richer detection dump for plot alignment checks:
+        // struct { uint64 idx; float metric; float threshold; uint8 state; uint32 copied; }
+        // Enable with: WIFI_DUMP_CORR=1
+        static bool det_meta_init = false;
+        static bool det_meta_enabled = false;
+        static FILE* fp_det_meta = nullptr;
+        if (!det_meta_init) {
+            det_meta_init = true;
+            det_meta_enabled = (std::getenv("WIFI_DUMP_CORR") != nullptr);
+            if (det_meta_enabled) {
+                const char* det_meta_path = std::getenv("WIFI_DUMP_SHORT_DET_META_PATH");
+                fp_det_meta = std::fopen(det_meta_path ? det_meta_path
+                                                       : "/tmp/sync_short_det_meta.bin",
+                                         "wb");
+            }
+        }
+        if (det_meta_enabled && fp_det_meta) {
+            std::fwrite(&input_item, sizeof(uint64_t), 1, fp_det_meta);
+            std::fwrite(&cor_metric, sizeof(float), 1, fp_det_meta);
+            const float threshold = static_cast<float>(d_threshold);
+            std::fwrite(&threshold, sizeof(float), 1, fp_det_meta);
+            std::fwrite(&state_id, sizeof(uint8_t), 1, fp_det_meta);
+            std::fwrite(&copied_in_state, sizeof(uint32_t), 1, fp_det_meta);
+            std::fflush(fp_det_meta);
+        }
+
         const uint64_t frame_id = d_next_frame_id++;
         frame_trace::note_sync_short(frame_id, "detected");
 
@@ -259,10 +339,36 @@ public:
     }
 
 private:
+    void dump_copy_region(uint64_t start_input, uint64_t end_input_exclusive)
+    {
+        // Optional COPY-state region dump for plot shading:
+        // writes pairs { uint64 start, uint64 end_exclusive }.
+        // Enable with: WIFI_DUMP_CORR=1
+        static bool copy_dump_init = false;
+        static bool copy_dump_enabled = false;
+        static FILE* fp_copy_regions = nullptr;
+        if (!copy_dump_init) {
+            copy_dump_init = true;
+            copy_dump_enabled = (std::getenv("WIFI_DUMP_CORR") != nullptr);
+            if (copy_dump_enabled) {
+                const char* path = std::getenv("WIFI_DUMP_SHORT_COPY_REGIONS_PATH");
+                fp_copy_regions =
+                    std::fopen(path ? path : "/tmp/sync_short_copy_regions.bin", "wb");
+            }
+        }
+        if (copy_dump_enabled && fp_copy_regions && end_input_exclusive > start_input) {
+            std::fwrite(&start_input, sizeof(uint64_t), 1, fp_copy_regions);
+            std::fwrite(&end_input_exclusive, sizeof(uint64_t), 1, fp_copy_regions);
+            std::fflush(fp_copy_regions);
+        }
+    }
+
     enum { SEARCH, COPY } d_state;
     int d_copied;
     int d_plateau;
     float d_freq_offset;
+    bool d_copy_region_open;
+    uint64_t d_copy_region_start_input;
     uint64_t d_next_frame_id;
     uint64_t d_work_calls;
     uint64_t d_items_in;
