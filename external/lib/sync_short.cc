@@ -279,6 +279,9 @@ public:
                     uint32_t copied_in_state)
     {
         mylog("frame start at in: {} out: {}", item, input_item);
+        const uint64_t frame_id = d_next_frame_id++;
+        frame_trace::note_sync_short(frame_id, "detected");
+
         // Optional detection index dump (absolute input sample index).
         // Enable with: WIFI_DUMP_CORR=1
         static bool dump_init = false;
@@ -299,7 +302,9 @@ public:
         }
 
         // Optional richer detection dump for plot alignment checks:
-        // struct { uint64 idx; float metric; float threshold; uint8 state; uint32 copied; }
+        // struct {
+        //   uint64 idx; float metric; float threshold; uint8 state; uint32 copied; uint64 frame_id;
+        // }
         // Enable with: WIFI_DUMP_CORR=1
         static bool det_meta_init = false;
         static bool det_meta_enabled = false;
@@ -321,11 +326,9 @@ public:
             std::fwrite(&threshold, sizeof(float), 1, fp_det_meta);
             std::fwrite(&state_id, sizeof(uint8_t), 1, fp_det_meta);
             std::fwrite(&copied_in_state, sizeof(uint32_t), 1, fp_det_meta);
+            std::fwrite(&frame_id, sizeof(uint64_t), 1, fp_det_meta);
             std::fflush(fp_det_meta);
         }
-
-        const uint64_t frame_id = d_next_frame_id++;
-        frame_trace::note_sync_short(frame_id, "detected");
 
         const pmt::pmt_t key = pmt::string_to_symbol("wifi_start");
         const pmt::pmt_t value = pmt::from_double(freq_offset);

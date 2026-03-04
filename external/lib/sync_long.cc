@@ -97,6 +97,7 @@ public:
         static FILE* fp_long_mag = nullptr;
         static FILE* fp_long_cplx = nullptr;
         static FILE* fp_long_det = nullptr;
+        static FILE* fp_long_det_meta = nullptr;
         static uint64_t long_corr_counter = 0; // count of dumped correlation samples
         if (!dump_init) {
             dump_init = true;
@@ -105,12 +106,16 @@ public:
                 const char* mag_path = std::getenv("WIFI_DUMP_LONG_MAG_PATH");
                 const char* cplx_path = std::getenv("WIFI_DUMP_LONG_CPLX_PATH");
                 const char* det_path = std::getenv("WIFI_DUMP_LONG_DET_PATH");
+                const char* det_meta_path = std::getenv("WIFI_DUMP_LONG_DET_META_PATH");
                 fp_long_mag =
                     std::fopen(mag_path ? mag_path : "/tmp/sync_long_cor_mag.bin", "wb");
                 fp_long_cplx =
                     std::fopen(cplx_path ? cplx_path : "/tmp/sync_long_cor_cplx.bin", "wb");
                 fp_long_det =
                     std::fopen(det_path ? det_path : "/tmp/sync_long_det.bin", "wb");
+                fp_long_det_meta = std::fopen(det_meta_path ? det_meta_path
+                                                            : "/tmp/sync_long_det_meta.bin",
+                                              "wb");
             }
         }
 
@@ -201,6 +206,13 @@ public:
                         std::fwrite(&peak1, sizeof(uint64_t), 1, fp_long_det);
                         std::fwrite(&peak2, sizeof(uint64_t), 1, fp_long_det);
                         std::fflush(fp_long_det);
+                        if (fp_long_det_meta) {
+                            const uint64_t frame_id = d_current_frame_id;
+                            std::fwrite(&frame_id, sizeof(uint64_t), 1, fp_long_det_meta);
+                            std::fwrite(&peak1, sizeof(uint64_t), 1, fp_long_det_meta);
+                            std::fwrite(&peak2, sizeof(uint64_t), 1, fp_long_det_meta);
+                            std::fflush(fp_long_det_meta);
+                        }
                     }
                     mylog("LONG: frame start at {}",d_frame_start);
                     d_offset = 0;
