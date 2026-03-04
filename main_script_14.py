@@ -752,7 +752,7 @@ class wifi_rx_file(gr.top_block):
         self.blocks_moving_average_xx_0 = blocks.moving_average_ff(self.window_size, 1, 4000, 1)
         self.blocks_divide_xx_0 = blocks.divide_ff(1)
 
-        self.ieee802_11_sync_short_0 = ieee802_11.sync_short(0.56, 5, False, False)
+        self.ieee802_11_sync_short_0 = ieee802_11.sync_short(0.7, 2, False, False)
         self.blocks_delay_0 = blocks.delay(gr.sizeof_gr_complex * 1, self.sync_length)
         self.ieee802_11_sync_long_0 = ieee802_11.sync_long(self.sync_length, False, False)
 
