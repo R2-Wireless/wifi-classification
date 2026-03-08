@@ -473,10 +473,43 @@ class OutputParser:
 class FileProcessor:
     """Process individual .cfile and extract information"""
 
-    def __init__(self, main_script_path, oui_db, use_compact=True):
+    def __init__(self, main_script_path, oui_db, use_compact=True, dump_bin=False, dump_dir=None):
         self.main_script = main_script_path
         self.oui_db = oui_db
         self.use_compact = use_compact
+        self.dump_bin = dump_bin
+        self.dump_dir = dump_dir
+
+    @staticmethod
+    def _safe_name(name: str) -> str:
+        return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+
+    def _build_dump_env(self, cfile_path: str):
+        if not self.dump_bin:
+            return None, None
+
+        cfile = Path(cfile_path)
+        parent = self._safe_name(cfile.parent.name)
+        stem = self._safe_name(cfile.stem)
+        prefix = f"{parent}__{stem}"
+
+        dump_root = Path(self.dump_dir if self.dump_dir else cfile.parent / "dumps")
+        dump_root.mkdir(parents=True, exist_ok=True)
+
+        env = os.environ.copy()
+        env["WIFI_DUMP_CORR"] = "1"
+        env["WIFI_DUMP_SHORT_COR_PATH"] = str(dump_root / f"{prefix}_short_cor.bin")
+        env["WIFI_DUMP_SHORT_ABS_PATH"] = str(dump_root / f"{prefix}_short_abs.bin")
+        env["WIFI_DUMP_SHORT_DET_PATH"] = str(dump_root / f"{prefix}_short_det.bin")
+        env["WIFI_DUMP_SHORT_DET_META_PATH"] = str(dump_root / f"{prefix}_short_det_meta.bin")
+        env["WIFI_DUMP_SHORT_COPY_REGIONS_PATH"] = str(
+            dump_root / f"{prefix}_short_copy_regions.txt"
+        )
+        env["WIFI_DUMP_LONG_MAG_PATH"] = str(dump_root / f"{prefix}_long_mag.bin")
+        env["WIFI_DUMP_LONG_CPLX_PATH"] = str(dump_root / f"{prefix}_long_cplx.bin")
+        env["WIFI_DUMP_LONG_DET_PATH"] = str(dump_root / f"{prefix}_long_det.bin")
+        env["WIFI_DUMP_LONG_DET_META_PATH"] = str(dump_root / f"{prefix}_long_det_meta.bin")
+        return env, dump_root
 
     def process_file(self, cfile_path, timeout=30):
         """Process a single .cfile and return analysis results"""
@@ -484,6 +517,9 @@ class FileProcessor:
         filename = os.path.basename(cfile_path)
         parent_dir = os.path.basename(os.path.dirname(cfile_path))
         print(f"📁 Processing: {parent_dir}/{filename}")
+        proc_env, dump_root = self._build_dump_env(cfile_path)
+        if self.dump_bin and dump_root is not None:
+            print(f"  🧪 Dump bin enabled: {dump_root}")
 
         result = {
             "filename": filename,
@@ -518,6 +554,7 @@ class FileProcessor:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                env=proc_env,
             )
 
             output_lines = []
@@ -1028,6 +1065,16 @@ def main():
         action="store_true",
         help="Run main_script in verbose mode (slower but includes Addr1-4, DS direction, flags)",
     )
+    parser.add_argument(
+        "--dump-bin",
+        action="store_true",
+        help="Enable WIFI_DUMP_CORR and write per-file dump bin files.",
+    )
+    parser.add_argument(
+        "--dump-dir",
+        default=None,
+        help="Directory for dump bin files (default: <each cfile parent>/dumps).",
+    )
 
     args = parser.parse_args()
 
@@ -1057,7 +1104,13 @@ def main():
     print(f"✅ Loaded {len(oui_db.oui_map)} OUI entries")
 
     use_compact = not args.verbose
-    processor = FileProcessor(args.main_script, oui_db, use_compact=use_compact)
+    processor = FileProcessor(
+        args.main_script,
+        oui_db,
+        use_compact=use_compact,
+        dump_bin=args.dump_bin,
+        dump_dir=args.dump_dir,
+    )
     results = []
 
     mode_str = "COMPACT" if use_compact else "VERBOSE (with full address details)"

@@ -22,6 +22,7 @@
 #include "viterbi_decoder/viterbi_decoder.h"
 #include <ieee802_11/constellations.h>
 #include <ieee802_11/frame_equalizer.h>
+#include <cstdint>
 
 namespace gr {
 namespace ieee802_11 {
@@ -54,11 +55,14 @@ private:
     bool d_debug;
     bool d_log;
     int d_current_symbol;
+    uint64_t d_current_frame_id;
     viterbi_decoder d_decoder;
 
     // freq offset
     double d_freq;                      // Hz
     double d_freq_offset_from_synclong; // Hz, estimation from "sync_long" block
+    double d_cfo_short_from_synclong;   // Hz, CFO estimate from sync_short
+    double d_cfo_long_from_synclong;    // Hz, CFO estimate from sync_long
     double d_bw;                        // Hz
     double d_er;
     double d_epsilon0;
@@ -76,6 +80,10 @@ private:
     constellation_qpsk::sptr d_qpsk;
     constellation_16qam::sptr d_16qam;
     constellation_64qam::sptr d_64qam;
+    uint64_t d_work_calls;
+    uint64_t d_items_in;
+    uint64_t d_items_out;
+    uint64_t d_work_time_ns;
 
     static const int interleaver_pattern[48];
 };

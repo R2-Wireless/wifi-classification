@@ -1,0 +1,122 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "C++ (GDB): main_script_14.py via /usr/bin/python3",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "/usr/bin/python3",
+      "args": [
+        "${workspaceFolder}/main_script_14.py",
+        "/mnt/c/Users/Public/Documents/Wify/Py_script/cfiles/Neo2_19_02/Neo2-Wifi-5180MHz-02-19-26-15h57m06s639_0001_20mhz_SNR_Both_dB.cfile",
+        "/tmp/debug_output.pcap"
+      ],
+      "cwd": "${workspaceFolder}",
+      "environment": [
+        {
+          "name": "PYTHONPATH",
+          "value": "${workspaceFolder}/external/python:${workspaceFolder}/external/build/python/bindings:${workspaceFolder}/external/build/python:${env:PYTHONPATH}"
+        },
+        {
+          "name": "LD_LIBRARY_PATH",
+          "value": "${workspaceFolder}/external/build/lib:${env:LD_LIBRARY_PATH}"
+        }
+      ],
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "additionalSOLibSearchPath": "${workspaceFolder}/external/build/lib",
+      "externalConsole": false,
+      "stopAtEntry": false,
+      "setupCommands": [
+        { "text": "-gdb-set breakpoint pending on" },
+        { "text": "-gdb-set auto-solib-add on" },
+        { "text": "-enable-pretty-printing" }
+      ]
+    },
+    {
+      "name": "Python (debugpy): main_script_14.py regular (prints+plots)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main_script_14.py",
+      "args": [
+        "/mnt/c/Users/Public/Documents/Wify/Py_script/cfiles/First batch/Anafi-AI-R21_0044_20mhz_SNR_300_dB.cfile",
+        "/tmp/debug_output.pcap"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1",
+        "MPLBACKEND": "TkAgg",
+        "PYTHONPATH": "${workspaceFolder}/external/python:${workspaceFolder}/external/build/python/bindings:${workspaceFolder}/external/build/python:${env:PYTHONPATH}",
+        "LD_LIBRARY_PATH": "${workspaceFolder}/external/build/lib:${env:LD_LIBRARY_PATH}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Python (debugpy): main_script_14.py verbose",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main_script_14.py",
+      "args": [
+        "/mnt/c/Users/Public/Documents/Wify/Py_script/cfiles/First batch/Anafi-AI-R21_0044_20mhz_SNR_300_dB.cfile",
+        "/tmp/debug_output.pcap"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/external/python:${workspaceFolder}/external/build/python/bindings:${workspaceFolder}/external/build/python:${env:PYTHONPATH}",
+        "LD_LIBRARY_PATH": "${workspaceFolder}/external/build/lib:${env:LD_LIBRARY_PATH}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Python (debugpy): main_script_14.py compact",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main_script_14.py",
+      "args": [
+        "/mnt/c/Users/Public/Documents/Wify/Py_script/cfiles/First batch/Anafi-AI-R21_0044_20mhz_SNR_300_dB.cfile",
+        "/tmp/debug_output.pcap",
+        "--compact"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/external/python:${workspaceFolder}/external/build/python/bindings:${workspaceFolder}/external/build/python:${env:PYTHONPATH}",
+        "LD_LIBRARY_PATH": "${workspaceFolder}/external/build/lib:${env:LD_LIBRARY_PATH}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Python (debugpy): main_script_14.py with freq offset",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main_script_14.py",
+      "args": [
+        "/mnt/c/Users/Public/Documents/Wify/Py_script/cfiles/First batch/Anafi-AI-R21_0044_20mhz_SNR_300_dB.cfile",
+        "/tmp/debug_output.pcap",
+        "--freq-offset",
+        "0"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/external/python:${workspaceFolder}/external/build/python/bindings:${workspaceFolder}/external/build/python:${env:PYTHONPATH}",
+        "LD_LIBRARY_PATH": "${workspaceFolder}/external/build/lib:${env:LD_LIBRARY_PATH}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Python (debugpy): enhanced_frame_analyzer_v3.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/enhanced_frame_analyzer_v3.py",
+      "args": [
+        "/mnt/c/Users/Public/Documents/Wify/Py_script/cfiles/Neo2_19_02",
+        "--verbose"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/external/python:${workspaceFolder}/external/build/python/bindings:${workspaceFolder}/external/build/python:${env:PYTHONPATH}",
+        "LD_LIBRARY_PATH": "${workspaceFolder}/external/build/lib:${env:LD_LIBRARY_PATH}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}
