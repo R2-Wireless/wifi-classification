@@ -11,6 +11,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo
   echo "Example:"
   echo "  ./run_analyzer_local.sh /path/to/cfiles --verbose"
+  echo "  ./run_analyzer_local.sh /path/to/cfiles --verbose --dump-bin --dump-dir /tmp/wifi_dumps"
   exit 0
 fi
 

@@ -26,6 +26,7 @@
 #include "utils.h"
 #include <gnuradio/io_signature.h>
 #include <chrono>
+#include <cstdio>
 #include <iostream>
 
 namespace gr {
@@ -365,6 +366,27 @@ bool frame_equalizer_impl::parse_signal(uint8_t* decoded_bits)
 
     int r = 0;
     d_frame_bytes = 0;
+
+    // 802.11a/g SIGNAL: bit 4 is reserved and must be zero.
+    if (decoded_bits[4]) {
+        dout << "SIGNAL: reserved bit set" << std::endl;
+        if (d_current_frame_id) {
+            frame_trace::note_equalizer(d_current_frame_id, "reserved_bit_set");
+        }
+        return false;
+    }
+
+    // 802.11a/g SIGNAL: tail bits [18..23] must all be zero.
+    for (int i = 18; i < 24; i++) {
+        if (decoded_bits[i]) {
+            dout << "SIGNAL: non-zero tail bits" << std::endl;
+            if (d_current_frame_id) {
+                frame_trace::note_equalizer(d_current_frame_id, "nonzero_tail_bits");
+            }
+            return false;
+        }
+    }
+
     bool parity = false;
     for (int i = 0; i < 17; i++) {
         parity ^= decoded_bits[i];
@@ -447,6 +469,18 @@ bool frame_equalizer_impl::parse_signal(uint8_t* decoded_bits)
           d_frame_encoding,
           d_frame_bytes,
           d_frame_symbols);
+    if (d_current_frame_id) {
+        const int min_for_signal = 128 + 80;
+        const int needed_raw_samples = min_for_signal + d_frame_symbols * 80;
+        std::fprintf(stderr,
+                     "[frame_equalizer][budget] frame_id=%llu bytes=%d n_sym=%d "
+                     "needed_raw_samples=%d min_for_signal=%d\n",
+                     static_cast<unsigned long long>(d_current_frame_id),
+                     d_frame_bytes,
+                     d_frame_symbols,
+                     needed_raw_samples,
+                     min_for_signal);
+    }
     return true;
 }
 

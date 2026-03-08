@@ -30,6 +30,7 @@
 #include <iostream>
 #include <cstdio>
 #include <cstdlib>
+#include <sstream>
 
 using namespace gr::ieee802_11;
 using namespace std;
@@ -145,7 +146,17 @@ public:
                 }
                 if (d_state == COPY) {
                     if (d_current_frame_id) {
-                        frame_trace::note_sync_long(d_current_frame_id, "interrupted");
+                        const int rel = d_offset - d_frame_start;
+                        const int copied = (rel > 0) ? rel : 0;
+                        std::ostringstream ss;
+                        ss << "interrupted copied=" << copied;
+                        frame_trace::note_sync_long(d_current_frame_id, ss.str());
+
+                        std::fprintf(
+                            stderr,
+                            "[sync_long][interrupt] frame_id=%llu interrupted copied=%d\n",
+                            static_cast<unsigned long long>(d_current_frame_id),
+                            copied);
                     }
                     d_state = RESET;
                 }
@@ -332,6 +343,7 @@ public:
 
         // in case we don't find anything use SYNC_LENGTH
         d_frame_start = SYNC_LENGTH;
+        d_freq_offset = 0.0f;
 
         for (int i = 0; i < 3; i++) {
             for (int k = i + 1; k < 4; k++) {

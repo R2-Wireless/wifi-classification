@@ -30,7 +30,7 @@
 
 using namespace gr::ieee802_11;
 
-static const int MIN_GAP = 480;
+static const int MIN_GAP = 480*1;
 static const int MAX_SAMPLES = 540 * 80;
 
 enum SyncShortStateId : uint8_t { STATE_SEARCH = 0, STATE_COPY = 1 };

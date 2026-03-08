@@ -44,10 +44,10 @@ void ensure_registered()
                 return s + std::string(width - s.size(), ' ');
             };
 
-            const size_t w_id = 8;
+            const size_t w_id = 10;
             const size_t w_short = 14;
-            const size_t w_long = 20;
-            const size_t w_eq = 14;
+            const size_t w_long = 26;
+            const size_t w_eq = 22;
             const size_t w_dec = 28;
             const size_t w_out = 10;
 

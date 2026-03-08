@@ -15,4 +15,6 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   exit 0
 fi
 
-python3 "${ROOT_DIR}/main_script_14.py" "$@"
+# Merge stderr into stdout so shell redirection like `> ttt.log` captures
+# both normal logs and diagnostics from C++ blocks.
+python3 "${ROOT_DIR}/main_script_14.py" "$@" 2>&1
