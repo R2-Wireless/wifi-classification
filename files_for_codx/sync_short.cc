@@ -303,8 +303,7 @@ public:
 
         // Optional richer detection dump for plot alignment checks:
         // struct {
-        //   uint64 idx; float metric; float threshold; uint8 state; uint32 copied;
-        //   uint64 frame_id; uint64 tag_output_idx;
+        //   uint64 idx; float metric; float threshold; uint8 state; uint32 copied; uint64 frame_id;
         // }
         // Enable with: WIFI_DUMP_CORR=1
         static bool det_meta_init = false;
@@ -321,13 +320,16 @@ public:
             }
         }
         if (det_meta_enabled && fp_det_meta) {
-            std::fwrite(&input_item, sizeof(uint64_t), 1, fp_det_meta);
+            std::fwrite(&input_item, sizeof(uint64_t), 1, fp_det_meta);  // abs input idx
             std::fwrite(&cor_metric, sizeof(float), 1, fp_det_meta);
             const float threshold = static_cast<float>(d_threshold);
             std::fwrite(&threshold, sizeof(float), 1, fp_det_meta);
             std::fwrite(&state_id, sizeof(uint8_t), 1, fp_det_meta);
             std::fwrite(&copied_in_state, sizeof(uint32_t), 1, fp_det_meta);
             std::fwrite(&frame_id, sizeof(uint64_t), 1, fp_det_meta);
+            // tag_output_idx: nitems_written(0) at tag insertion = the sync_long
+            // input item index at which this wifi_start tag arrives. This is the
+            // bridge between sync_long's sl_idx space and absolute sample index.
             std::fwrite(&item, sizeof(uint64_t), 1, fp_det_meta);
             std::fflush(fp_det_meta);
         }

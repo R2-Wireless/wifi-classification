@@ -765,6 +765,16 @@ class wifi_rx_file(gr.top_block):
             ieee802_11.Equalizer(self.chan_est), self.freq, self.samp_rate, True, True
         )
         self.ieee802_11_decode_mac_0 = ieee802_11.decode_mac(True, True)
+        
+        #-----------------------------------------------------
+
+        from sync_long_capture_probe import SyncLongCaptureProbe
+
+        # after line 757 (ieee802_11_sync_long_0 instantiation):
+        self.capture_probe = SyncLongCaptureProbe("/tmp/sync_long_capture.npz")
+
+
+        #-----------------------------------------------------
 
         # Connections
         self.connect((self.blocks_file_source_0, 0), (self.blocks_multiply_const, 0))
@@ -799,7 +809,17 @@ class wifi_rx_file(gr.top_block):
         self.connect((self.ieee802_11_sync_short_0, 0), (self.blocks_delay_0, 0))
         self.connect((self.ieee802_11_sync_short_0, 0), (self.ieee802_11_sync_long_0, 0))
         self.connect((self.blocks_delay_0, 0), (self.ieee802_11_sync_long_0, 1))
-        self.connect((self.ieee802_11_sync_long_0, 0), (self.blocks_stream_to_vector_0, 0))
+        #self.connect((self.ieee802_11_sync_long_0, 0), (self.blocks_stream_to_vector_0, 0))
+        
+        #--------------------------
+        # replace the original single connection on line 802:
+        #   self.connect((self.ieee802_11_sync_long_0, 0), (self.blocks_stream_to_vector_0, 0))
+        # with these two:
+        self.connect((self.ieee802_11_sync_long_0,  0), (self.capture_probe,             0))
+        self.connect((self.capture_probe,           0), (self.blocks_stream_to_vector_0, 0))
+
+        #-----------------------------
+        
         self.connect((self.blocks_stream_to_vector_0, 0), (self.fft_vxx_0, 0))
         self.connect((self.fft_vxx_0, 0), (self.ieee802_11_frame_equalizer_0, 0))
         self.connect((self.ieee802_11_frame_equalizer_0, 0), (self.ieee802_11_decode_mac_0, 0))

@@ -96,24 +96,27 @@ public:
         static bool dump_init = false;
         static bool dump_enabled = false;
         static FILE* fp_long_mag = nullptr;
-        static FILE* fp_long_mag_abs = nullptr;
         static FILE* fp_long_cplx = nullptr;
         static FILE* fp_long_det = nullptr;
         static FILE* fp_long_det_meta = nullptr;
+        // Indexed magnitude dump: pairs { uint64 sync_long_input_idx, float32 mag }
+        // sync_long_input_idx == nitems_read(0)+i, which is sync_short's output
+        // item counter. MATLAB reconstructs absolute sample index using
+        // short_det_meta (which records the absolute input idx of each wifi_start
+        // tag AND the nitems_written(0) value at that point in sync_short).
+        static FILE* fp_long_mag_abs = nullptr;
         static uint64_t long_corr_counter = 0; // count of dumped correlation samples
         if (!dump_init) {
             dump_init = true;
             dump_enabled = (std::getenv("WIFI_DUMP_CORR") != nullptr);
             if (dump_enabled) {
                 const char* mag_path = std::getenv("WIFI_DUMP_LONG_MAG_PATH");
-                const char* mag_abs_path = std::getenv("WIFI_DUMP_LONG_MAG_ABS_PATH");
                 const char* cplx_path = std::getenv("WIFI_DUMP_LONG_CPLX_PATH");
                 const char* det_path = std::getenv("WIFI_DUMP_LONG_DET_PATH");
                 const char* det_meta_path = std::getenv("WIFI_DUMP_LONG_DET_META_PATH");
+                const char* mag_abs_path = std::getenv("WIFI_DUMP_LONG_MAG_ABS_PATH");
                 fp_long_mag =
                     std::fopen(mag_path ? mag_path : "/tmp/sync_long_cor_mag.bin", "wb");
-                fp_long_mag_abs = std::fopen(
-                    mag_abs_path ? mag_abs_path : "/tmp/sync_long_cor_mag_abs.bin", "wb");
                 fp_long_cplx =
                     std::fopen(cplx_path ? cplx_path : "/tmp/sync_long_cor_cplx.bin", "wb");
                 fp_long_det =
@@ -121,6 +124,8 @@ public:
                 fp_long_det_meta = std::fopen(det_meta_path ? det_meta_path
                                                             : "/tmp/sync_long_det_meta.bin",
                                               "wb");
+                fp_long_mag_abs = std::fopen(
+                    mag_abs_path ? mag_abs_path : "/tmp/sync_long_cor_mag_abs.bin", "wb");
             }
         }
 
@@ -188,18 +193,23 @@ public:
 
                 d_cor.push_back(pair<gr_complex, int>(d_correlation[i], d_offset));
                 if (dump_enabled) {
+                    const float mag = std::abs(d_correlation[i]);
                     if (fp_long_mag) {
-                        const float mag = std::abs(d_correlation[i]);
                         std::fwrite(&mag, sizeof(float), 1, fp_long_mag);
-                    }
-                    if (fp_long_mag_abs) {
-                        const uint64_t sl_idx = nread + i;
-                        const float mag = std::abs(d_correlation[i]);
-                        std::fwrite(&sl_idx, sizeof(uint64_t), 1, fp_long_mag_abs);
-                        std::fwrite(&mag, sizeof(float), 1, fp_long_mag_abs);
                     }
                     if (fp_long_cplx) {
                         std::fwrite(&d_correlation[i], sizeof(gr_complex), 1, fp_long_cplx);
+                    }
+                    if (fp_long_mag_abs) {
+                        // sync_long input item index for this sample.
+                        // nread = nitems_read(0) at entry to this work() call,
+                        // which is the count of sync_short output items consumed
+                        // so far — directly comparable to wifi_start tag offsets
+                        // stored in short_det_meta. MATLAB uses this to map each
+                        // long correlation sample onto the absolute input sample axis.
+                        const uint64_t sl_idx = nread + static_cast<uint64_t>(i);
+                        std::fwrite(&sl_idx, sizeof(uint64_t), 1, fp_long_mag_abs);
+                        std::fwrite(&mag,    sizeof(float),    1, fp_long_mag_abs);
                     }
                 }
                 long_corr_counter++;

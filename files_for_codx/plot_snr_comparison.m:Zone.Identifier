@@ -1,0 +1,4 @@
+[ZoneTransfer]
+ZoneId=3
+ReferrerUrl=https://claude.ai/chat/5112ff7b-c1c4-4473-b781-6267a8572569
+HostUrl=https://claude.ai/api/organizations/486452b9-fd82-4224-8735-1255836d125c/conversations/5112ff7b-c1c4-4473-b781-6267a8572569/wiggle/download-file?path=%2Fmnt%2Fuser-data%2Foutputs%2Fplot_snr_comparison.m

@@ -506,6 +506,7 @@ class FileProcessor:
             dump_root / f"{prefix}_short_copy_regions.txt"
         )
         env["WIFI_DUMP_LONG_MAG_PATH"] = str(dump_root / f"{prefix}_long_mag.bin")
+        env["WIFI_DUMP_LONG_MAG_ABS_PATH"] = str(dump_root / f"{prefix}_long_mag_abs.bin")
         env["WIFI_DUMP_LONG_CPLX_PATH"] = str(dump_root / f"{prefix}_long_cplx.bin")
         env["WIFI_DUMP_LONG_DET_PATH"] = str(dump_root / f"{prefix}_long_det.bin")
         env["WIFI_DUMP_LONG_DET_META_PATH"] = str(dump_root / f"{prefix}_long_det_meta.bin")

@@ -4,7 +4,12 @@ function plot_sync_short_debug_3(short_cor_path, det_meta_path, copy_regions_pat
 % Binary inputs are produced by sync_short.cc when WIFI_DUMP_CORR=1:
 %   short_cor_path: float32 correlation array (default /tmp/sync_short_cor.bin)
 %   det_meta_path: records of:
-%       uint64 idx, float32 metric, float32 threshold, uint8 state, uint32 copied
+%       uint64 idx, float32 metric, float32 threshold, uint8 state, uint32 copied,
+%       [uint64 frame_id], [uint64 tag_output_idx]
+%       Supported record sizes:
+%         v1 = 21 bytes  (no frame_id, no tag_output_idx)
+%         v2 = 29 bytes  (with frame_id, no tag_output_idx)  -- legacy parser had this
+%         v3 = 37 bytes  (with frame_id AND tag_output_idx)  -- current sync_short.cc
 %       (default /tmp/sync_short_det_meta.bin)
 %   copy_regions_path: repeated pairs uint64 [start end_exclusive]
 %       (default /tmp/sync_short_copy_regions.bin)
@@ -217,6 +222,9 @@ end
 
 end
 
+% -------------------------------------------------------------------------
+% Helper: read float32 binary file
+% -------------------------------------------------------------------------
 function v = read_f32(path)
 fid = fopen(path, 'rb');
 if fid < 0
@@ -228,6 +236,24 @@ cleanup = onCleanup(@() fclose(fid));
 v = fread(fid, inf, 'single=>double');
 end
 
+% -------------------------------------------------------------------------
+% Helper: load sync_short det_meta binary
+%
+% C++ record layout (sync_short.cc insert_tag / dump det_meta):
+%   Field            Type       Bytes
+%   -------          --------   -----
+%   input_item       uint64       8
+%   cor_metric       float        4
+%   threshold        float        4
+%   state_id         uint8        1
+%   copied_in_state  uint32       4
+%   frame_id         uint64       8   (present in v2 and v3)
+%   tag_output_idx   uint64       8   (present in v3 only)
+%
+%   v1 total = 21 bytes  (no frame_id, no tag_output_idx)
+%   v2 total = 29 bytes  (with frame_id, no tag_output_idx)
+%   v3 total = 37 bytes  (with frame_id AND tag_output_idx)  <-- current
+% -------------------------------------------------------------------------
 function det = load_det_meta(path)
 det.idx = [];
 det.metric = [];
@@ -235,6 +261,7 @@ det.threshold = [];
 det.state = [];
 det.copied = [];
 det.frame_id = [];
+det.tag_output_idx = [];   % new field; NaN when not present in file
 
 fid = fopen(path, 'rb');
 if fid < 0
@@ -247,45 +274,68 @@ fseek(fid, 0, 'eof');
 nbytes = ftell(fid);
 fseek(fid, 0, 'bof');
 
-rec_v2 = 29;  % uint64 idx, float metric, float threshold, uint8 state, uint32 copied, uint64 frame_id
-rec_v1 = 21;  % uint64 idx, float metric, float threshold, uint8 state, uint32 copied
+% FIX: added rec_v3 = 37 to handle current sync_short.cc output which writes
+%      an extra uint64 tag_output_idx field after frame_id.
+rec_v3 = 37;  % uint64 idx + float metric + float threshold + uint8 state + uint32 copied + uint64 frame_id + uint64 tag_output_idx
+rec_v2 = 29;  % uint64 idx + float metric + float threshold + uint8 state + uint32 copied + uint64 frame_id
+rec_v1 = 21;  % uint64 idx + float metric + float threshold + uint8 state + uint32 copied
+
 has_frame_id = false;
-if mod(nbytes, rec_v2) == 0
+has_tag_output_idx = false;
+rec_bytes = rec_v1;
+
+if mod(nbytes, rec_v3) == 0 && nbytes > 0
+    rec_bytes = rec_v3;
+    has_frame_id = true;
+    has_tag_output_idx = true;
+elseif mod(nbytes, rec_v2) == 0 && nbytes > 0
     rec_bytes = rec_v2;
     has_frame_id = true;
-elseif mod(nbytes, rec_v1) == 0
+elseif mod(nbytes, rec_v1) == 0 && nbytes > 0
     rec_bytes = rec_v1;
 else
-    warning('Unexpected short det meta size (%d bytes), attempting v1 parsing.', nbytes);
-    rec_bytes = rec_v1;
+    warning('Unexpected det_meta size (%d bytes) — not divisible by v3=%d, v2=%d, or v1=%d. Attempting v3 parsing.', ...
+            nbytes, rec_v3, rec_v2, rec_v1);
+    rec_bytes = rec_v3;
+    has_frame_id = true;
+    has_tag_output_idx = true;
 end
 
 nrec = floor(nbytes / rec_bytes);
-idx = zeros(nrec, 1);
-metric = zeros(nrec, 1);
-threshold = zeros(nrec, 1);
-state = zeros(nrec, 1);
-copied = zeros(nrec, 1);
-frame_id = nan(nrec, 1);
+idx           = zeros(nrec, 1);
+metric        = zeros(nrec, 1);
+threshold     = zeros(nrec, 1);
+state         = zeros(nrec, 1);
+copied        = zeros(nrec, 1);
+frame_id      = nan(nrec, 1);
+tag_output_idx = nan(nrec, 1);
+
 for k = 1:nrec
-    idx(k) = fread(fid, 1, 'uint64=>double');
-    metric(k) = fread(fid, 1, 'single=>double');
+    idx(k)       = fread(fid, 1, 'uint64=>double');
+    metric(k)    = fread(fid, 1, 'single=>double');
     threshold(k) = fread(fid, 1, 'single=>double');
-    state(k) = fread(fid, 1, 'uint8=>double');
-    copied(k) = fread(fid, 1, 'uint32=>double');
+    state(k)     = fread(fid, 1, 'uint8=>double');
+    copied(k)    = fread(fid, 1, 'uint32=>double');
     if has_frame_id
         frame_id(k) = fread(fid, 1, 'uint64=>double');
     end
+    if has_tag_output_idx
+        tag_output_idx(k) = fread(fid, 1, 'uint64=>double');
+    end
 end
 
-det.idx = idx;
-det.metric = metric;
-det.threshold = threshold;
-det.state = state;
-det.copied = copied;
-det.frame_id = frame_id;
+det.idx           = idx;
+det.metric        = metric;
+det.threshold     = threshold;
+det.state         = state;
+det.copied        = copied;
+det.frame_id      = frame_id;
+det.tag_output_idx = tag_output_idx;
 end
 
+% -------------------------------------------------------------------------
+% Helper: load copy regions [start, end_exclusive] pairs
+% -------------------------------------------------------------------------
 function regions = load_copy_regions(path)
 fid = fopen(path, 'rb');
 if fid < 0
@@ -303,6 +353,9 @@ end
 regions = r;
 end
 
+% -------------------------------------------------------------------------
+% Helper: read uint64 flat binary file
+% -------------------------------------------------------------------------
 function v = load_u64(path)
 fid = fopen(path, 'rb');
 if fid < 0
@@ -314,6 +367,9 @@ cleanup = onCleanup(@() fclose(fid));
 v = fread(fid, inf, 'uint64=>double');
 end
 
+% -------------------------------------------------------------------------
+% Helper: pair consecutive uint64 values from fp_long_det into [peak1, peak2]
+% -------------------------------------------------------------------------
 function regions = build_long_regions(long_det)
 if isempty(long_det)
     regions = zeros(0, 2);
@@ -328,6 +384,9 @@ for i = 1:n
 end
 end
 
+% -------------------------------------------------------------------------
+% Helper: load sync_long det_meta (frame_id, peak1, peak2) — 3 x uint64 per record
+% -------------------------------------------------------------------------
 function meta = load_long_det_meta(path)
 meta.frame_id = [];
 meta.peak1 = [];
@@ -347,15 +406,19 @@ if n < 1
     return;
 end
 raw = raw(1:(3 * n));
-raw = reshape(raw, 3, n).';
+raw = reshape(raw, 3, n).';  % n x 3: columns are [frame_id, peak1, peak2]
 meta.frame_id = raw(:, 1);
-meta.peak1 = raw(:, 2);
-meta.peak2 = raw(:, 3);
+meta.peak1    = raw(:, 2);
+meta.peak2    = raw(:, 3);
 end
 
+% -------------------------------------------------------------------------
+% Helper: map short copy regions to their det record by matching start index
+% Returns per-region frame_id and state (NaN when no match found).
+% -------------------------------------------------------------------------
 function [region_frame_id, region_state] = map_short_regions_to_det(regions, det)
 region_frame_id = nan(size(regions, 1), 1);
-region_state = nan(size(regions, 1), 1);
+region_state    = nan(size(regions, 1), 1);
 if isempty(regions) || isempty(det.idx)
     return;
 end
@@ -368,6 +431,10 @@ if any(tf)
 end
 end
 
+% -------------------------------------------------------------------------
+% Helper: shade copy-region patches coloured by state (SEARCH vs COPY)
+% regions(:,1) = start (inclusive), regions(:,2) = end_exclusive
+% -------------------------------------------------------------------------
 function [h_search_legend, h_copy_legend] = shade_regions_by_state(regions, det, y_min, y_max)
 h_search_legend = [];
 h_copy_legend = [];
@@ -391,14 +458,14 @@ copy_seen = false;
 
 for k = 1:size(regions, 1)
     x1 = regions(k, 1);
-    x2 = regions(k, 2) - 1;
+    x2 = regions(k, 2) - 1;  % end_exclusive -> last inclusive sample
     if x2 < x1
         continue;
     end
 
     st = state_by_start(k);
     if st == 0
-        color_rgb = [0.76 0.88 1.00];  % SEARCH-start
+        color_rgb = [0.76 0.88 1.00];  % SEARCH-start: light blue
         alpha = 0.22;
         search_seen = true;
     elseif st == 1

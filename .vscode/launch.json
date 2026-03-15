@@ -117,6 +117,41 @@
       },
       "console": "integratedTerminal",
       "justMyCode": false
+    },
+    {
+      "name": "Python (debugpy): sync_long_replay.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/sync_long_replay.py",
+      "args": [
+        "/tmp/sync_long_capture.npz",
+        "/tmp/replay_output.pcap"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONPATH": "${workspaceFolder}/external/python:${workspaceFolder}/external/build/python/bindings:${workspaceFolder}/external/build/python:${env:PYTHONPATH}",
+        "LD_LIBRARY_PATH": "${workspaceFolder}/external/build/lib:${env:LD_LIBRARY_PATH}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Python (debugpy): sync_long_replay.py compact",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/sync_long_replay.py",
+      "args": [
+        "/tmp/sync_long_capture.npz",
+        "/tmp/replay_output.pcap",
+        "--compact"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONPATH": "${workspaceFolder}/external/python:${workspaceFolder}/external/build/python/bindings:${workspaceFolder}/external/build/python:${env:PYTHONPATH}",
+        "LD_LIBRARY_PATH": "${workspaceFolder}/external/build/lib:${env:LD_LIBRARY_PATH}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
     }
   ]
 }
