@@ -14,6 +14,7 @@ external/lib/decode_mac_origin.cc
 
 # local/runtime
 
+cap.npz
 ttt.log
 out_run_local.log
 .vscode/
