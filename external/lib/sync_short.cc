@@ -388,6 +388,17 @@ private:
 sync_short::sptr
 sync_short::make(double threshold, unsigned int min_plateau, bool log, bool debug)
 {
+    return sync_short::make(threshold, min_plateau, log, debug, 1);
+}
+
+sync_short::sptr
+sync_short::make(double threshold,
+                 unsigned int min_plateau,
+                 bool log,
+                 bool debug,
+                 unsigned int sts_periods)
+{
+    (void)sts_periods; // Used only by sync_combined build.
     return gnuradio::get_initial_sptr(
         new sync_short_impl(threshold, min_plateau, log, debug));
 }

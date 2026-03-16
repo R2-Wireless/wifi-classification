@@ -27,10 +27,18 @@ class IEEE802_11_API sync_short : virtual public block
 {
 public:
     typedef std::shared_ptr<sync_short> sptr;
+    // Backward-compatible factory used by existing binaries/bindings.
     static sptr make(double threshold,
                      unsigned int min_plateau,
                      bool log = false,
                      bool debug = false);
+
+    // Extended factory used by sync_combined mode.
+    static sptr make(double threshold,
+                     unsigned int min_plateau,
+                     bool log,
+                     bool debug,
+                     unsigned int sts_periods = 1);
 };
 
 } // namespace ieee802_11

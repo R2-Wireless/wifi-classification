@@ -714,7 +714,8 @@ class message_handler(gr.sync_block):
 # =============================================================================
 
 class wifi_rx_file(gr.top_block):
-    def __init__(self, filename, output_pcap, freq_offset=0.0, verbose=True):
+    def __init__(self, filename, output_pcap, freq_offset=0.0, verbose=True,
+                 use_sync_combined=False, sts_periods=1):
         gr.top_block.__init__(self, "WiFi RX from File")
 
         self.window_size = 48
@@ -752,7 +753,21 @@ class wifi_rx_file(gr.top_block):
         self.blocks_moving_average_xx_0 = blocks.moving_average_ff(self.window_size, 1, 4000, 1)
         self.blocks_divide_xx_0 = blocks.divide_ff(1)
 
-        self.ieee802_11_sync_short_0 = ieee802_11.sync_short(0.7, 5, False, False)
+        # ── Sync block selection ──────────────────────────────────────────────
+        # use_sync_combined=True  → sync_combined.cc factory functions
+        #   (compiled with -DUSE_SYNC_COMBINED=1; sts_periods controls the
+        #    number of STS periods coherently averaged, 1 = original behaviour)
+        # use_sync_combined=False → original separate sync_short / sync_long
+        if use_sync_combined:
+            # sync_short::make(threshold, min_plateau, log, debug, sts_periods)
+            self.ieee802_11_sync_short_0 = ieee802_11.sync_short(
+                0.7, 5, False, False, int(sts_periods))
+            print(f"[wifi_rx_file] Using sync_combined  sts_periods={sts_periods}")
+        else:
+            self.ieee802_11_sync_short_0 = ieee802_11.sync_short(0.7, 5, False, False)
+            if sts_periods != 1:
+                print("[wifi_rx_file] WARNING: --sts-periods ignored because "
+                      "--use-sync-combined was not set")
         self.blocks_delay_0 = blocks.delay(gr.sizeof_gr_complex * 1, self.sync_length)
         self.ieee802_11_sync_long_0 = ieee802_11.sync_long(self.sync_length, False, False)
 
@@ -844,6 +859,34 @@ def argument_parser():
                         help="Use compact one-line output instead of verbose summaries")
     parser.add_argument("--gr-perf", action="store_true",
                         help="Enable GNU Radio built-in performance counters (pc_*) and print per-stage timing tables")
+    # ── sync_combined controls ────────────────────────────────────────────────
+    # Requires the library to have been compiled with -DUSE_SYNC_COMBINED=1.
+    parser.add_argument(
+        "--use-sync-combined",
+        dest="use_sync_combined",
+        action="store_true",
+        default=False,
+        help=(
+            "Use sync_combined.cc factory functions (requires -DUSE_SYNC_COMBINED=1 "
+            "at compile time).  When not set, the original sync_short.cc / "
+            "sync_long.cc translation units are used."
+        ),
+    )
+    parser.add_argument(
+        "--sts-periods",
+        dest="sts_periods",
+        type=int,
+        default=1,
+        metavar="M",
+        help=(
+            "Number of 16-sample STS periods to coherently average in sync_short "
+            "(only effective with --use-sync-combined).  "
+            "M=1 → original behaviour (default).  "
+            "M=3 → ~4.8 dB gain, 32 samples extra latency.  "
+            "M=5 → ~7.0 dB gain, 64 samples extra latency.  "
+            "Clamped to [1, 10] inside the C++ block."
+        ),
+    )
     return parser
 
 
@@ -1022,6 +1065,8 @@ def main(top_block_cls=wifi_rx_file, options=None):
         output_pcap=options.output_pcap,
         freq_offset=float(options.freq_offset),
         verbose=verbose,
+        use_sync_combined=options.use_sync_combined,
+        sts_periods=int(options.sts_periods),
     )
     setup_done_ns = time.perf_counter_ns()
     run_start_ns = 0

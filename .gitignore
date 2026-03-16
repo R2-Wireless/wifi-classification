@@ -17,3 +17,9 @@ external/lib/decode_mac_origin.cc
 ttt.log
 out_run_local.log
 .vscode/
+main_script_14_.py
+ttt1.log
+ttt2.log
+ttt_cap.log
+external/lib/sync_combined.cc:Zone.Identifier
+main_script_14.py:Zone.Identifier

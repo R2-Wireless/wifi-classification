@@ -14,7 +14,7 @@
 /* BINDTOOL_GEN_AUTOMATIC(0)                                                       */
 /* BINDTOOL_USE_PYGCCXML(0)                                                        */
 /* BINDTOOL_HEADER_FILE(sync_short.h)                                        */
-/* BINDTOOL_HEADER_FILE_HASH(ce2bf4884eae2d4c7695586469e38b17)                     */
+/* BINDTOOL_HEADER_FILE_HASH(3006a04aee076d9ed30fd1740b418aa3)                     */
 /***********************************************************************************/
 
 #include <pybind11/complex.h>
@@ -36,11 +36,14 @@ void bind_sync_short(py::module& m)
     py::class_<sync_short, gr::block, gr::basic_block,
         std::shared_ptr<sync_short>>(m, "sync_short", D(sync_short))
 
-        .def(py::init(&sync_short::make),
+        .def(py::init((sync_short::sptr (*)(
+                          double, unsigned int, bool, bool, unsigned int))
+                      &sync_short::make),
            py::arg("threshold"),
            py::arg("min_plateau"),
            py::arg("log") = false,
            py::arg("debug") = false,
+           py::arg("sts_periods") = 1,
            D(sync_short,make)
         )
         
@@ -53,9 +56,6 @@ void bind_sync_short(py::module& m)
 
 
 }
-
-
-
 
 
 

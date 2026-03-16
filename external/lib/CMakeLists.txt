@@ -37,13 +37,22 @@ list(APPEND ieee802_11_sources
     mapper_impl.cc
     parse_mac.cc
     signal_field_impl.cc
-    sync_long.cc
-    sync_short.cc
     timing_stats.cc
     utils.cc
     viterbi_decoder/base.cc
     append_crc32_impl.cc
 )
+
+if(USE_SYNC_COMBINED)
+    list(APPEND ieee802_11_sources
+        sync_combined.cc
+    )
+else()
+    list(APPEND ieee802_11_sources
+        sync_long.cc
+        sync_short.cc
+    )
+endif()
 
 # use SSE2 optimized viterbi implementation if SSE2 is enabled
 if(SSE2_SUPPORTED)
@@ -63,6 +72,9 @@ if(NOT ieee802_11_sources)
 endif(NOT ieee802_11_sources)
 
 add_library(gnuradio-ieee802_11 SHARED ${ieee802_11_sources})
+if(USE_SYNC_COMBINED)
+    target_compile_definitions(gnuradio-ieee802_11 PRIVATE USE_SYNC_COMBINED=1)
+endif()
 target_link_libraries(gnuradio-ieee802_11
         gnuradio::gnuradio-runtime
         gnuradio::gnuradio-filter

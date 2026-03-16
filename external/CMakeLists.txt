@@ -13,6 +13,8 @@ cmake_minimum_required(VERSION 3.8)
 project(gr-ieee802_11 CXX C)
 enable_testing()
 
+option(USE_SYNC_COMBINED "Build sync_short/sync_long from sync_combined.cc" OFF)
+
 # Install to PyBOMBS target prefix if defined
 if(DEFINED ENV{PYBOMBS_PREFIX})
     set(CMAKE_INSTALL_PREFIX $ENV{PYBOMBS_PREFIX})
