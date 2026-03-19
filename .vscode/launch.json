@@ -103,6 +103,25 @@
       "justMyCode": false
     },
     {
+      "name": "Python (debugpy): main_script_14.py sync-long-only",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main_script_14.py",
+      "args": [
+        //"/mnt/c/Users/Public/Documents/Wify/Py_script/cfiles/First batch/Anafi-AI-R21_0044_20mhz_SNR_300_dB.cfile",
+        "/mnt/c/Users/Public/Documents/Wify/Py_script/cfiles/snr_test/Anafi-AI-R22_0001_20mhz_SNR_30_dB.cfile",
+        "/tmp/debug_output_sync_long_only.pcap",
+        "--sync-long-only"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONPATH": "${workspaceFolder}/external/python:${workspaceFolder}/external/build/python/bindings:${workspaceFolder}/external/build/python:${env:PYTHONPATH}",
+        "LD_LIBRARY_PATH": "${workspaceFolder}/external/build/lib:${env:LD_LIBRARY_PATH}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
       "name": "Python (debugpy): enhanced_frame_analyzer_v3.py",
       "type": "debugpy",
       "request": "launch",

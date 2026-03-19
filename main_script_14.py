@@ -25,10 +25,12 @@ v11 UPDATED:
 
 from gnuradio import blocks, fft, gr
 from gnuradio.fft import window
+import numpy as np
 import os
 import sys
 import signal
 import struct
+import tempfile
 import time
 import re
 import math
@@ -36,6 +38,12 @@ from argparse import ArgumentParser
 from collections import defaultdict
 import ieee802_11
 import pmt
+from sync_long_python import (
+    SyncLongConfig,
+    build_sync_long_capture,
+    detect_sync_long_frames,
+    load_complex64_file,
+)
 
 
 
@@ -710,6 +718,125 @@ class message_handler(gr.sync_block):
 
 
 # =============================================================================
+# Sync-long-only replay helpers
+# =============================================================================
+
+class TagInjectBlock(gr.sync_block):
+    def __init__(self, tags: list):
+        gr.sync_block.__init__(
+            self,
+            name="tag_inject",
+            in_sig=[np.complex64],
+            out_sig=[np.complex64],
+        )
+        self._pending = sorted(tags, key=lambda t: t["offset"])
+        self._pending_idx = 0
+        self.set_tag_propagation_policy(gr.TPP_ALL_TO_ALL)
+
+    def work(self, input_items, output_items):
+        in0 = input_items[0]
+        out = output_items[0]
+        n = len(in0)
+        if n == 0:
+            return 0
+
+        out[:n] = in0[:n]
+        write_base = self.nitems_written(0)
+        write_end = write_base + n
+
+        while self._pending_idx < len(self._pending):
+            tag = self._pending[self._pending_idx]
+            abs_off = int(tag["offset"])
+            if abs_off >= write_end:
+                break
+            if abs_off < write_base:
+                abs_off = write_base
+
+            key_pmt = pmt.string_to_symbol(tag["key"])
+            if tag["value_type"] == "u64":
+                val_pmt = pmt.from_uint64(int(tag["value_u64"]))
+            else:
+                val_pmt = pmt.from_double(float(tag["value_f64"]))
+
+            self.add_item_tag(0, abs_off, key_pmt, val_pmt, pmt.string_to_symbol("tag_inject"))
+            self._pending_idx += 1
+
+        return n
+
+
+class wifi_rx_sync_long_only(gr.top_block):
+    def __init__(self, capture, output_pcap, verbose=True, freq=5.180e9, samp_rate=20e6):
+        gr.top_block.__init__(self, "WiFi RX Sync Long Only")
+
+        self.freq = freq
+        self.samp_rate = samp_rate
+        self.chan_est = ieee802_11.LS
+
+        self.pcap = PCAPWriter(output_pcap)
+        self.msg_handler = message_handler(
+            self.pcap,
+            center_freq_hz=self.freq,
+            samp_rate_hz=self.samp_rate,
+            verbose=verbose,
+        )
+
+        samples = np.asarray(capture["samples"], dtype=np.complex64)
+        inject_tags = []
+        for idx, key in enumerate(capture["tag_keys"]):
+            tag_type = str(capture["tag_value_types"][idx])
+            inject_tags.append({
+                "offset": int(capture["tag_offsets"][idx]),
+                "key": str(key),
+                "value_type": tag_type,
+                "value_f64": float(capture["tag_values_f64"][idx]) if tag_type == "f64" else 0.0,
+                "value_u64": int(capture["tag_values_u64"][idx]) if tag_type == "u64" else 0,
+            })
+
+        self._tmpfile = tempfile.NamedTemporaryFile(
+            suffix=".bin", delete=False, prefix="sync_long_only_"
+        )
+        samples.tofile(self._tmpfile)
+        self._tmpfile.flush()
+        self._tmpfile.close()
+
+        self.file_source = blocks.file_source(
+            gr.sizeof_gr_complex,
+            self._tmpfile.name,
+            False,
+            0,
+            0,
+        )
+        self.file_source.set_begin_tag(pmt.PMT_NIL)
+        self.throttle = blocks.throttle(gr.sizeof_gr_complex, self.samp_rate, True)
+        self.tag_inject = TagInjectBlock(inject_tags)
+        self.stream_to_vector = blocks.stream_to_vector(gr.sizeof_gr_complex, 64)
+        self.fft_block = fft.fft_vcc(64, True, window.rectangular(64), True, 1)
+        self.stream_to_vector.set_tag_propagation_policy(gr.TPP_ALL_TO_ALL)
+        self.fft_block.set_tag_propagation_policy(gr.TPP_ALL_TO_ALL)
+        self.frame_equalizer = ieee802_11.frame_equalizer(
+            ieee802_11.Equalizer(self.chan_est), self.freq, self.samp_rate, True, True
+        )
+        self.decode_mac = ieee802_11.decode_mac(True, True)
+
+        self.connect((self.file_source, 0), (self.throttle, 0))
+        self.connect((self.throttle, 0), (self.tag_inject, 0))
+        self.connect((self.tag_inject, 0), (self.stream_to_vector, 0))
+        self.connect((self.stream_to_vector, 0), (self.fft_block, 0))
+        self.connect((self.fft_block, 0), (self.frame_equalizer, 0))
+        self.connect((self.frame_equalizer, 0), (self.decode_mac, 0))
+
+        self.msg_connect((self.decode_mac, "out"), (self.msg_handler, "in"))
+        self.msg_connect((self.decode_mac, "out_fail"), (self.msg_handler, "in"))
+
+    def __del__(self):
+        try:
+            if hasattr(self, "_tmpfile") and os.path.exists(self._tmpfile.name):
+                os.unlink(self._tmpfile.name)
+        except Exception:
+            pass
+
+
+# =============================================================================
 # GNU Radio Top Block
 # =============================================================================
 
@@ -887,6 +1014,30 @@ def argument_parser():
             "Clamped to [1, 10] inside the C++ block."
         ),
     )
+    parser.add_argument(
+        "--sync-long-only",
+        action="store_true",
+        default=False,
+        help="Bypass sync_short/sync_long GNU Radio blocks and use the Python sync_long detector path.",
+    )
+    parser.add_argument(
+        "--sync-long-no-cfo-search",
+        action="store_true",
+        default=False,
+        help="Disable the Python sync_long CFO-bin search in --sync-long-only mode.",
+    )
+    parser.add_argument(
+        "--sync-long-cfo-start",
+        type=int,
+        default=-100,
+        help="Start CFO search step for --sync-long-only mode (MATLAB-compatible units).",
+    )
+    parser.add_argument(
+        "--sync-long-cfo-end",
+        type=int,
+        default=100,
+        help="End CFO search step for --sync-long-only mode (MATLAB-compatible units).",
+    )
     return parser
 
 
@@ -1035,6 +1186,29 @@ def _print_gr_stage_perf_tables(tb, file_total_ns: int, run_ns: int, run_non_han
     print("[timing] +------------------------------+------------+----------+----------+----------+")
 
 
+def _prepare_python_sync_long_capture(options):
+    cfg = SyncLongConfig(
+        samp_rate=20e6,
+        expected_gap=64,
+        with_freqoffset_search=not options.sync_long_no_cfo_search,
+        cfo_start_idx=int(options.sync_long_cfo_start),
+        cfo_end_idx=int(options.sync_long_cfo_end),
+    )
+    iq_data = load_complex64_file(options.input_file)
+    print(f"[sync_long_only] Loaded {len(iq_data):,} IQ samples from {options.input_file}")
+    detection = detect_sync_long_frames(iq_data, cfg)
+    capture = build_sync_long_capture(iq_data, detection, cfg)
+    print(
+        "[sync_long_only] "
+        f"best_freq={capture.get('best_freq_hz', 0.0):+.1f} Hz  "
+        f"threshold={capture.get('threshold', 0.0):.3f}  "
+        f"peak_count={len(capture.get('sorted_peaks', []))}  "
+        f"frame_count={capture.get('frame_count', 0)}  "
+        f"packed_samples={len(capture['samples']):,}"
+    )
+    return capture
+
+
 def main(top_block_cls=wifi_rx_file, options=None):
     file_t0_ns = time.perf_counter_ns()
     setup_start_ns = file_t0_ns
@@ -1056,18 +1230,27 @@ def main(top_block_cls=wifi_rx_file, options=None):
     print(f"Mode:   {'Verbose' if verbose else 'Compact'}")
     if options.freq_offset != 0.0:
         print(f"Freq offset correction: {options.freq_offset} Hz")
+    print(f"Sync-long-only path: {'ON' if options.sync_long_only else 'OFF'}")
     print(f"GNU Radio perf counters: {'ON' if options.gr_perf else 'OFF'}")
     print("=" * 80)
     print()
 
-    tb = top_block_cls(
-        filename=options.input_file,
-        output_pcap=options.output_pcap,
-        freq_offset=float(options.freq_offset),
-        verbose=verbose,
-        use_sync_combined=options.use_sync_combined,
-        sts_periods=int(options.sts_periods),
-    )
+    if options.sync_long_only:
+        capture = _prepare_python_sync_long_capture(options)
+        tb = wifi_rx_sync_long_only(
+            capture=capture,
+            output_pcap=options.output_pcap,
+            verbose=verbose,
+        )
+    else:
+        tb = top_block_cls(
+            filename=options.input_file,
+            output_pcap=options.output_pcap,
+            freq_offset=float(options.freq_offset),
+            verbose=verbose,
+            use_sync_combined=options.use_sync_combined,
+            sts_periods=int(options.sts_periods),
+        )
     setup_done_ns = time.perf_counter_ns()
     run_start_ns = 0
     run_end_ns = setup_done_ns
