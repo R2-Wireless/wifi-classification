@@ -44,6 +44,8 @@ from sync_long_python import (
     detect_sync_long_frames,
     load_complex64_file,
 )
+from wifi_scan_result import build_wifi_scan_result
+from wifi_scan_result import classify_wifi
 
 
 
@@ -107,6 +109,17 @@ DECODE_FRAME_TYPE = {
     1: True,  # Control
     2: True,  # Data
     3: True,  # Extension/Reserved
+}
+
+ENCODING_INFO = {
+    0: ("3 Mbit/s", "BPSK 1/2"),
+    1: ("4.5 Mbit/s", "BPSK 3/4"),
+    2: ("6 Mbit/s", "QPSK 1/2"),
+    3: ("9 Mbit/s", "QPSK 3/4"),
+    4: ("12 Mbit/s", "16-QAM 1/2"),
+    5: ("18 Mbit/s", "16-QAM 3/4"),
+    6: ("24 Mbit/s", "64-QAM 2/3"),
+    7: ("27 Mbit/s", "64-QAM 3/4"),
 }
 
 MGMT_SUBTYPE_NAMES = {
@@ -499,6 +512,7 @@ class message_handler(gr.sync_block):
         self.stage_count = defaultdict(int)
         self.total_msg_time_ns = 0
         self.total_msg_count = 0
+        self.decoded_frames = []
 
         self.message_port_register_in(pmt.intern("in"))
         self.set_msg_handler(pmt.intern("in"), self.handle_msg)
@@ -522,6 +536,27 @@ class message_handler(gr.sync_block):
             return bool(pmt.to_bool(v))
         except Exception:
             return bool(default)
+
+    @staticmethod
+    def _meta_get_uint64(meta, key: str, default: int = 0) -> int:
+        v = pmt.dict_ref(meta, pmt.intern(key), pmt.from_uint64(default))
+        try:
+            return int(pmt.to_uint64(v))
+        except Exception:
+            return int(default)
+
+    def _record_decoded_frame(self, meta, fcs_ok, data, fc_info, roles, ssid, decode_drop_reason=None):
+        self.decoded_frames.append({
+            "frame_id": self._meta_get_uint64(meta, "frame_id", 0),
+            "fcs_ok": bool(fcs_ok),
+            "data": data,
+            "fc_info": fc_info,
+            "roles": roles,
+            "ssid": ssid,
+            "decode_drop_reason": decode_drop_reason,
+            "signal_encoding": self._meta_get_uint64(meta, "encoding", 0),
+            "signal_frame_bytes": self._meta_get_uint64(meta, "frame bytes", 0),
+        })
 
     def handle_msg(self, msg):
         t_msg_start_ns = time.perf_counter_ns()
@@ -563,6 +598,15 @@ class message_handler(gr.sync_block):
 
             if fc_info["version"] != 0:
                 self.stats.add_failure("Invalid 802.11 version")
+                self._record_decoded_frame(
+                    meta,
+                    fcs_ok=False,
+                    data=data,
+                    fc_info=fc_info,
+                    roles={},
+                    ssid=None,
+                    decode_drop_reason="version_fail",
+                )
                 print("CHECKSUM: Checksum FAILED - Invalid 802.11 version")
                 return
 
@@ -602,6 +646,7 @@ class message_handler(gr.sync_block):
                 else:
                     self._print_compact_summary(data, fc_info, roles, snr_db, cfo_hz, ssid)
                 self._add_stage_time("print_summary", time.perf_counter_ns() - t0)
+                self._record_decoded_frame(meta, fcs_ok, data, fc_info, roles, ssid, "fcs_fail")
                 print("CHECKSUM: Checksum FAILED - FCS")
                 return
 
@@ -630,6 +675,7 @@ class message_handler(gr.sync_block):
                 antenna=None,
             )
             self._add_stage_time("pcap_write", time.perf_counter_ns() - t0)
+            self._record_decoded_frame(meta, fcs_ok, data, fc_info, roles, ssid, None)
 
         except Exception as e:
             self.stats.add_failure(f"Exception: {str(e)[:50]}")
@@ -1206,7 +1252,87 @@ def _prepare_python_sync_long_capture(options):
         f"frame_count={capture.get('frame_count', 0)}  "
         f"packed_samples={len(capture['samples']):,}"
     )
-    return capture
+    return capture, detection
+
+
+def _fmt_scan_cell(value, width: int) -> str:
+    text = "" if value is None else str(value)
+    if len(text) > width:
+        if width <= 3:
+            return text[:width]
+        return text[: width - 3] + "..."
+    return text
+
+
+def _print_wifi_scan_summary(scan_result):
+    print("\n[scan_result] Summary")
+    print(f"[scan_result] classification = {getattr(scan_result, 'classification', 'n/a')}")
+    print(f"[scan_result] is_wifi      = {scan_result.is_wifi}")
+    print(f"[scan_result] is_vendor    = {scan_result.is_vendor}")
+    print(f"[scan_result] vendor_names = {scan_result.vendor_names}")
+    print(f"[scan_result] SSID         = {scan_result.SSID}")
+    print(f"[scan_result] SSID_all     = {scan_result.SSID_all}")
+    print(
+        f"[scan_result] frames       = {scan_result.frame_count}  "
+        f"fcs_pass={scan_result.fcs_pass_count}  fcs_fail={scan_result.fcs_fail_count}"
+    )
+    stats = getattr(scan_result, "classification_stats", {}) or {}
+    if stats:
+        print(f"[scan_result] joint_fp_prob = {stats.get('joint_fp_prob', 'n/a')}")
+        print(
+            "[scan_result] evidence      = "
+            f"fcs_pass:{stats.get('n_fcs_pass', 0)}  "
+            f"signal_ok:{stats.get('n_signal_ok', 0)}  "
+            f"signal_fc:{stats.get('n_signal_fc', 0)}  "
+            f"lts_only:{stats.get('n_lts_only', 0)}"
+        )
+
+    if not scan_result.frames:
+        print("[scan_result] No frame details available.")
+        return
+
+    print("[scan_result] +----+-----+----------+----------+----------------------+----------------+----------------------+------------------+")
+    print("[scan_result] | id | fcs | peak1    | peak2    | type                 | rate           | ssid                 | reason           |")
+    print("[scan_result] +----+-----+----------+----------+----------------------+----------------+----------------------+------------------+")
+    for frame in scan_result.frames:
+        fcs_text = "PASS" if frame.fcs_ok else "FAIL"
+        print(
+            "[scan_result] | "
+            f"{frame.frame_id:2d} | "
+            f"{fcs_text:4s} | "
+            f"{frame.peak_indices[0]:8d} | "
+            f"{frame.peak_indices[1]:8d} | "
+            f"{_fmt_scan_cell(frame.frame_type_str, 20):20s} | "
+            f"{_fmt_scan_cell(getattr(frame, 'signal_rate_str', None), 14):14s} | "
+            f"{_fmt_scan_cell(frame.ssid, 20):20s} | "
+            f"{_fmt_scan_cell(getattr(frame, 'decode_drop_reason', None), 16):16s} |"
+        )
+    print("[scan_result] +----+-----+----------+----------+----------------------+----------------+----------------------+------------------+")
+    print("[scan_result] expected lengths:")
+    for frame in scan_result.frames:
+        print(
+            f"[scan_result]   frame {frame.frame_id:2d}: "
+            f"{frame.expected_length_str}"
+        )
+
+    _, evidences, _ = classify_wifi(scan_result)
+    if evidences:
+        print("[scan_result] evidence:")
+        print("[scan_result] +----+-----+--------+----------+----------+----------+------------------+")
+        print("[scan_result] | id | fcs | signal | fc_valid | peak_gap | lts_pair | reason           |")
+        print("[scan_result] +----+-----+--------+----------+----------+----------+------------------+")
+        for ev in evidences:
+            print(
+                "[scan_result] | "
+                f"{ev.frame_id:2d} | "
+                f"{str(ev.fcs_ok):4s} | "
+                f"{str(ev.signal_ok):6s} | "
+                f"{str(ev.fc_valid):8s} | "
+                f"{ev.peak_gap:8d} | "
+                f"{str(ev.lts_pair_ok):8s} | "
+                f"{_fmt_scan_cell(ev.drop_reason, 16):16s} |"
+            )
+        print("[scan_result] +----+-----+--------+----------+----------+----------+------------------+")
 
 
 def main(top_block_cls=wifi_rx_file, options=None):
@@ -1235,8 +1361,12 @@ def main(top_block_cls=wifi_rx_file, options=None):
     print("=" * 80)
     print()
 
+    capture = None
+    detection = None
+    scan_result = None
+
     if options.sync_long_only:
-        capture = _prepare_python_sync_long_capture(options)
+        capture, detection = _prepare_python_sync_long_capture(options)
         tb = wifi_rx_sync_long_only(
             capture=capture,
             output_pcap=options.output_pcap,
@@ -1377,6 +1507,16 @@ def main(top_block_cls=wifi_rx_file, options=None):
     except KeyboardInterrupt:
         run_end_ns = time.perf_counter_ns()
         pass
+
+    if options.sync_long_only and capture is not None and detection is not None:
+        scan_result = build_wifi_scan_result(
+            capture=capture,
+            corr_long=detection["corr_long"],
+            decoded_frames=tb.msg_handler.decoded_frames,
+            resolver=tb.msg_handler.resolver,
+        )
+        tb.scan_result = scan_result
+        _print_wifi_scan_summary(scan_result)
 
     print_final_timing()
 

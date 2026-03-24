@@ -30,3 +30,4 @@ ttt.cap.log
 .gitignore
 ttt_capture.log
 sync_long_capture.log
+ttt_long_only.log
