@@ -556,6 +556,7 @@ class message_handler(gr.sync_block):
             "decode_drop_reason": decode_drop_reason,
             "signal_encoding": self._meta_get_uint64(meta, "encoding", 0),
             "signal_frame_bytes": self._meta_get_uint64(meta, "frame bytes", 0),
+            "snr_db": self._meta_get_double(meta, "snr", 0.0),
         })
 
     def handle_msg(self, msg):
@@ -1264,6 +1265,21 @@ def _fmt_scan_cell(value, width: int) -> str:
     return text
 
 
+def _frame_identity_text(frame) -> str:
+    parts = []
+    if getattr(frame, "ssid", None):
+        parts.append(f"SSID={frame.ssid}")
+    if getattr(frame, "vendor", None):
+        parts.append(f"Vendor={frame.vendor}")
+    return " | ".join(parts)
+
+
+def _fmt_scan_float(value, width: int, precision: int = 1) -> str:
+    if value is None:
+        return " " * width
+    return f"{float(value):{width}.{precision}f}"
+
+
 def _print_wifi_scan_summary(scan_result):
     print("\n[scan_result] Summary")
     print(f"[scan_result] classification = {getattr(scan_result, 'classification', 'n/a')}")
@@ -1291,9 +1307,9 @@ def _print_wifi_scan_summary(scan_result):
         print("[scan_result] No frame details available.")
         return
 
-    print("[scan_result] +----+-----+----------+----------+----------------------+----------------+----------------------+------------------+")
-    print("[scan_result] | id | fcs | peak1    | peak2    | type                 | rate           | ssid                 | reason           |")
-    print("[scan_result] +----+-----+----------+----------+----------------------+----------------+----------------------+------------------+")
+    print("[scan_result] +----+-----+----------+----------+----------+----------+--------+---------+--------------------------+------------------+--------------------------+------------------+")
+    print("[scan_result] | id | fcs | peak1    | peak2    | p1_mag   | p2_mag   | snr_db | lts_snr | type                     | rate             | ssid/vendor              | reason           |")
+    print("[scan_result] +----+-----+----------+----------+----------+----------+--------+---------+--------------------------+------------------+--------------------------+------------------+")
     for frame in scan_result.frames:
         fcs_text = "PASS" if frame.fcs_ok else "FAIL"
         print(
@@ -1302,12 +1318,16 @@ def _print_wifi_scan_summary(scan_result):
             f"{fcs_text:4s} | "
             f"{frame.peak_indices[0]:8d} | "
             f"{frame.peak_indices[1]:8d} | "
-            f"{_fmt_scan_cell(frame.frame_type_str, 20):20s} | "
-            f"{_fmt_scan_cell(getattr(frame, 'signal_rate_str', None), 14):14s} | "
-            f"{_fmt_scan_cell(frame.ssid, 20):20s} | "
+            f"{frame.peak_values[0]:8.1f} | "
+            f"{frame.peak_values[1]:8.1f} | "
+            f"{_fmt_scan_float(getattr(frame, 'snr_db', None), 6, 1)} | "
+            f"{_fmt_scan_float(getattr(frame, 'lts_snr_db', None), 7, 1)} | "
+            f"{_fmt_scan_cell(frame.frame_type_str, 24):24s} | "
+            f"{_fmt_scan_cell(getattr(frame, 'signal_rate_str', None), 16):16s} | "
+            f"{_fmt_scan_cell(_frame_identity_text(frame), 24):24s} | "
             f"{_fmt_scan_cell(getattr(frame, 'decode_drop_reason', None), 16):16s} |"
         )
-    print("[scan_result] +----+-----+----------+----------+----------------------+----------------+----------------------+------------------+")
+    print("[scan_result] +----+-----+----------+----------+----------+----------+--------+---------+--------------------------+------------------+--------------------------+------------------+")
     print("[scan_result] expected lengths:")
     for frame in scan_result.frames:
         print(
@@ -1514,6 +1534,7 @@ def main(top_block_cls=wifi_rx_file, options=None):
             corr_long=detection["corr_long"],
             decoded_frames=tb.msg_handler.decoded_frames,
             resolver=tb.msg_handler.resolver,
+            lts_snr_db_list=capture.get("lts_snr_db"),
         )
         tb.scan_result = scan_result
         _print_wifi_scan_summary(scan_result)

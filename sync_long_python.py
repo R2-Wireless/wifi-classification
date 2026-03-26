@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -56,6 +56,7 @@ class SyncLongConfig:
     threshold_scale: float = 0.7
     rms_stride: int = 30
     max_copy: int = 540 * 80
+    #max_copy: int = 3000000 * 80
     min_symbols: int = 3
     peak_search_safe_len: int = 700
     peak_search_max_len: int = 300
@@ -186,6 +187,30 @@ def get_sort_long_peaks(peak_indices: np.ndarray, corr_long: np.ndarray, cfg: Sy
     return np.array(filtered, dtype=np.int64)
 
 
+def compute_lts_snr_db(iq_freq_corr: np.ndarray, peak1: int, peak2: int) -> Optional[float]:
+    """Estimate effective SNR from the two repeated LTS symbols."""
+    lts1_start = peak1 - 64
+    lts2_start = peak2 - 64
+    if lts1_start < 0 or lts2_start < 0:
+        return None
+    if peak1 > len(iq_freq_corr) or peak2 > len(iq_freq_corr):
+        return None
+
+    lts1 = iq_freq_corr[lts1_start:peak1]
+    lts2 = iq_freq_corr[lts2_start:peak2]
+    if len(lts1) != 64 or len(lts2) != 64:
+        return None
+
+    signal_power = float(np.mean(np.abs(0.5 * (lts1 + lts2)) ** 2))
+    diff = lts1 - lts2
+    noise_power = float(0.5 * np.mean(np.abs(diff) ** 2))
+    if noise_power <= 0.0 or signal_power <= 0.0:
+        return None
+
+    snr = signal_power / noise_power
+    return float(10.0 * np.log10(snr)) if snr > 0.0 else None
+
+
 def detect_sync_long_frames(iq_data: np.ndarray, cfg: SyncLongConfig | None = None) -> Dict[str, object]:
     cfg = cfg or SyncLongConfig()
     if len(iq_data) == 0:
@@ -271,6 +296,7 @@ def build_sync_long_capture(iq_data: np.ndarray, detection: Dict[str, object], c
     tag_values_f64: List[float] = []
     tag_values_u64: List[int] = []
     tag_value_types: List[str] = []
+    lts_snr_db_list: List[Optional[float]] = []
 
     n_out_total = 0
     frame_count = 0
@@ -321,6 +347,8 @@ def build_sync_long_capture(iq_data: np.ndarray, detection: Dict[str, object], c
         tag_off = n_out_total
         n_out_total += n_out
         frame_count += 1
+        lts_snr_db = compute_lts_snr_db(iq_data_freq_corr, int(peak1), int(peak2))
+        lts_snr_db_list.append(lts_snr_db)
         all_samples.append(out)
 
         for key, f64_val, u64_val, typ in (
@@ -347,4 +375,5 @@ def build_sync_long_capture(iq_data: np.ndarray, detection: Dict[str, object], c
         "best_freq_hz": float(detection.get("best_freq_hz", 0.0)),
         "threshold": float(detection.get("threshold", 0.0)),
         "sorted_peaks": sorted_peaks,
+        "lts_snr_db": lts_snr_db_list,
     }

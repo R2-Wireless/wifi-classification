@@ -239,6 +239,8 @@ class FrameDetail:
     signal_encoding: Optional[int] = None
     signal_frame_bytes: int = 0
     signal_rate_str: str = "unknown"
+    snr_db: Optional[float] = None
+    lts_snr_db: Optional[float] = None
     fc_info: dict = field(default_factory=dict)
     data: bytes = field(default_factory=bytes)
 
@@ -264,7 +266,13 @@ class WifiScanResult:
     classification_stats: dict = field(default_factory=dict)
 
 
-def build_wifi_scan_result(capture: dict, corr_long: np.ndarray, decoded_frames: List[dict], resolver=None) -> WifiScanResult:
+def build_wifi_scan_result(
+    capture: dict,
+    corr_long: np.ndarray,
+    decoded_frames: List[dict],
+    resolver=None,
+    lts_snr_db_list: Optional[List[Optional[float]]] = None,
+) -> WifiScanResult:
     sorted_peaks = np.asarray(capture.get("sorted_peaks", []), dtype=np.int64)
     pair_count = len(sorted_peaks) // 2
     corr_long = np.asarray(corr_long, dtype=np.float32)
@@ -301,6 +309,7 @@ def build_wifi_scan_result(capture: dict, corr_long: np.ndarray, decoded_frames:
         frame_id = fr_idx + 1
         p1, p2 = int(peaks_per_frame[fr_idx, 0]), int(peaks_per_frame[fr_idx, 1])
         v1, v2 = _peak_values(p1, p2)
+        lts_snr = lts_snr_db_list[fr_idx] if lts_snr_db_list and fr_idx < len(lts_snr_db_list) else None
         all_peak_indices_list.extend([p1, p2])
         all_peak_values_list.extend([v1, v2])
 
@@ -317,6 +326,7 @@ def build_wifi_scan_result(capture: dict, corr_long: np.ndarray, decoded_frames:
                 ssid=None,
                 vendor=None,
                 decode_drop_reason="not_reached",
+                lts_snr_db=lts_snr,
             ))
             frames_type_list.append("unknown (not reached)")
             frames_explen_list.append("n/a")
@@ -333,6 +343,7 @@ def build_wifi_scan_result(capture: dict, corr_long: np.ndarray, decoded_frames:
         sig_encoding = None if sig_encoding_raw in (None, "") else int(sig_encoding_raw)
         sig_frame_bytes = int(pdu.get("signal_frame_bytes", 0))
         sig_rate_str = _rate_str(sig_encoding)
+        sig_snr_db = pdu.get("snr_db")
 
         if drop_reason == "version_fail":
             neighbour_types = [frame.frame_type_str for frame in frame_details] + frames_type_list
@@ -386,6 +397,8 @@ def build_wifi_scan_result(capture: dict, corr_long: np.ndarray, decoded_frames:
             signal_encoding=sig_encoding,
             signal_frame_bytes=sig_frame_bytes,
             signal_rate_str=sig_rate_str,
+            snr_db=None if sig_snr_db is None else float(sig_snr_db),
+            lts_snr_db=lts_snr,
             fc_info=fc_info,
             data=data,
         ))
