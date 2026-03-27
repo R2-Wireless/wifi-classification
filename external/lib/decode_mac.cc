@@ -46,6 +46,7 @@ public:
           d_ofdm(BPSK_1_2),
           d_frame(d_ofdm, 0),
           copied(0),
+          d_skip_frame(false),
           d_frame_complete(true),
           d_current_frame_id(0),
           d_work_calls(0),
@@ -127,6 +128,7 @@ public:
                     d_ofdm = ofdm;
                     d_frame = frame;
                     copied = 0;
+                    d_skip_frame = false;
                     if (d_current_frame_id) {
                         frame_trace::note_decode(d_current_frame_id, "collecting_symbols");
                     }
@@ -137,12 +139,18 @@ public:
                         frame_trace::note_decode(d_current_frame_id, "frame_too_large");
                         frame_trace::note_outcome(d_current_frame_id, "dropped");
                     }
+                    // Skip this frame entirely until a new wifi_start-tagged
+                    // frame arrives. Do not let stale or synthetic frame
+                    // parameters trigger symbol collection or decode().
+                    copied = 0;
+                    d_skip_frame = true;
+                    d_frame_complete = true;
                     dout << "Dropping frame which is too large (symbols or bits)"
                          << std::endl;
                 }
             }
 
-            if (copied < d_frame.n_sym) {
+            if (!d_skip_frame && copied < d_frame.n_sym) {
                 dout << "copy one symbol, copied " << copied << " out of "
                      << d_frame.n_sym << std::endl;
                 std::memcpy(d_rx_symbols + (copied * 48), in, 48);
@@ -353,6 +361,7 @@ private:
     uint8_t out_bytes[MAX_PSDU_SIZE + 2]; // 2 for signal field
 
     int copied;
+    bool d_skip_frame;
     bool d_frame_complete;
     uint64_t d_current_frame_id;
     uint64_t d_work_calls;

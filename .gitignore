@@ -31,3 +31,6 @@ ttt.cap.log
 ttt_capture.log
 sync_long_capture.log
 ttt_long_only.log
+ttt_long_only_second_fail.log
+ttt_long_only_second_pass.log
+ttt_long_Skydio
