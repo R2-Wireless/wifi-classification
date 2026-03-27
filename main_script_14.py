@@ -42,7 +42,10 @@ from sync_long_python import (
     SyncLongConfig,
     build_sync_long_capture,
     detect_sync_long_frames,
+    get_long_training_sequence,
     load_complex64_file,
+    load_mat_file,
+    save_long_corr_debug_mat,
 )
 from wifi_scan_result import build_wifi_scan_result
 from wifi_scan_result import classify_wifi
@@ -1024,9 +1027,22 @@ class wifi_rx_file(gr.top_block):
 
 def argument_parser():
     parser = ArgumentParser()
-    parser.add_argument("input_file", help="Input IQ file (.cfile format, complex64)")
+    parser.add_argument(
+        "input_file",
+        help="Input IQ file (.cfile complex64, or .mat MATLAB complex IQ)",
+    )
     parser.add_argument("output_pcap", nargs="?", default="/tmp/wifi_output_radiotap.pcap",
                         help="Output PCAP file (radiotap)")
+    parser.add_argument(
+        "--samp-rate-in",
+        dest="samp_rate_in",
+        type=float,
+        default=None,
+        help=(
+            "Input sample rate in Hz for .mat files (default: 30.72e6). "
+            "The data is resampled to 20 MHz before processing. Ignored for .cfile inputs."
+        ),
+    )
     parser.add_argument("--freq-offset", dest="freq_offset", type=float, default=0.0,
                         help="Coarse frequency offset correction in Hz")
     parser.add_argument("--compact", action="store_true",
@@ -1084,6 +1100,23 @@ def argument_parser():
         type=int,
         default=100,
         help="End CFO search step for --sync-long-only mode (MATLAB-compatible units).",
+    )
+    parser.add_argument(
+        "--long-training-mode",
+        choices=["cc", "orin"],
+        default="cc",
+        help=(
+            "Long-training sequence to use in --sync-long-only mode. "
+            "'cc' matches sync_long.cc, 'orin' uses the alternate long_seq_orin ordering."
+        ),
+    )
+    parser.add_argument(
+        "--dump-long-corr-mat",
+        default=None,
+        help=(
+            "In --sync-long-only mode, save long-correlation debug data to a MATLAB .mat file "
+            "(path with or without .mat suffix)."
+        ),
     )
     return parser
 
@@ -1240,13 +1273,28 @@ def _prepare_python_sync_long_capture(options):
         with_freqoffset_search=not options.sync_long_no_cfo_search,
         cfo_start_idx=int(options.sync_long_cfo_start),
         cfo_end_idx=int(options.sync_long_cfo_end),
+        long_training=get_long_training_sequence(options.long_training_mode),
     )
-    iq_data = load_complex64_file(options.input_file)
-    print(f"[sync_long_only] Loaded {len(iq_data):,} IQ samples from {options.input_file}")
+    input_path = options.input_file
+    if input_path.lower().endswith(".mat"):
+        samp_rate_in = float(options.samp_rate_in) if options.samp_rate_in else 30.72e6
+        print(
+            f"[sync_long_only] Loading .mat file (input rate={samp_rate_in / 1e6:.2f} MHz, "
+            "resampling to 20.00 MHz)..."
+        )
+        iq_data = load_mat_file(input_path, samp_rate_in=samp_rate_in, samp_rate_out=20e6)
+    else:
+        iq_data = load_complex64_file(input_path)
+
+    print(f"[sync_long_only] Loaded {len(iq_data):,} IQ samples from {input_path}")
     detection = detect_sync_long_frames(iq_data, cfg)
     capture = build_sync_long_capture(iq_data, detection, cfg)
+    if options.dump_long_corr_mat:
+        mat_path = save_long_corr_debug_mat(options.dump_long_corr_mat, iq_data, detection, capture)
+        print(f"[sync_long_only] long correlation debug saved to: {mat_path}")
     print(
         "[sync_long_only] "
+        f"training={options.long_training_mode}  "
         f"best_freq={capture.get('best_freq_hz', 0.0):+.1f} Hz  "
         f"threshold={capture.get('threshold', 0.0):.3f}  "
         f"peak_count={len(capture.get('sorted_peaks', []))}  "
@@ -1254,6 +1302,15 @@ def _prepare_python_sync_long_capture(options):
         f"packed_samples={len(capture['samples']):,}"
     )
     return capture, detection
+
+
+def _mat_to_tmp_cfile(mat_path: str, samp_rate_in: float = 30.72e6) -> str:
+    """Convert a .mat IQ file to a temporary complex64 .cfile at 20 MHz."""
+    iq_data = load_mat_file(mat_path, samp_rate_in=samp_rate_in, samp_rate_out=20e6)
+    tmp = tempfile.NamedTemporaryFile(suffix=".cfile", delete=False, prefix="mat_iq_")
+    iq_data.tofile(tmp)
+    tmp.close()
+    return tmp.name
 
 
 def _fmt_scan_cell(value, width: int) -> str:
@@ -1377,6 +1434,8 @@ def main(top_block_cls=wifi_rx_file, options=None):
     if options.freq_offset != 0.0:
         print(f"Freq offset correction: {options.freq_offset} Hz")
     print(f"Sync-long-only path: {'ON' if options.sync_long_only else 'OFF'}")
+    if not options.sync_long_only and options.long_training_mode != "cc":
+        print("[warning] --long-training-mode only affects --sync-long-only; regular GNU Radio path still uses sync_long.cc")
     print(f"GNU Radio perf counters: {'ON' if options.gr_perf else 'OFF'}")
     print("=" * 80)
     print()
@@ -1384,6 +1443,15 @@ def main(top_block_cls=wifi_rx_file, options=None):
     capture = None
     detection = None
     scan_result = None
+    temp_input_path = None
+
+    input_path = options.input_file
+    if input_path.lower().endswith(".mat") and not options.sync_long_only:
+        samp_rate_in = float(options.samp_rate_in) if options.samp_rate_in else 30.72e6
+        print(f"[mat] Converting .mat -> temp .cfile (resample {samp_rate_in / 1e6:.2f} -> 20.00 MHz)...")
+        temp_input_path = _mat_to_tmp_cfile(input_path, samp_rate_in=samp_rate_in)
+        print(f"[mat] Temp file: {temp_input_path}")
+        input_path = temp_input_path
 
     if options.sync_long_only:
         capture, detection = _prepare_python_sync_long_capture(options)
@@ -1394,7 +1462,7 @@ def main(top_block_cls=wifi_rx_file, options=None):
         )
     else:
         tb = top_block_cls(
-            filename=options.input_file,
+            filename=input_path,
             output_pcap=options.output_pcap,
             freq_offset=float(options.freq_offset),
             verbose=verbose,
@@ -1513,6 +1581,8 @@ def main(top_block_cls=wifi_rx_file, options=None):
             nonlocal run_end_ns
             run_end_ns = time.perf_counter_ns()
             print_final_timing()
+            if temp_input_path and os.path.exists(temp_input_path):
+                os.unlink(temp_input_path)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, sig_handler)
@@ -1547,6 +1617,9 @@ def main(top_block_cls=wifi_rx_file, options=None):
     print(f"✓ Handler saw {tb.msg_handler.packet_count} PDUs (good+bad if published)")
     print(f"✓ Written Radiotap PCAP to: {options.output_pcap}")
     print("=" * 80)
+
+    if temp_input_path and os.path.exists(temp_input_path):
+        os.unlink(temp_input_path)
 
 
 if __name__ == "__main__":

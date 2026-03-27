@@ -45,14 +45,19 @@ LONG_TRAINING = np.array([
     complex(-0.0455, 1.0679), complex(1.3868, -0.0000),
 ], dtype=np.complex64)
 
+# Alternate 64-sample long sequence derived from the provided long_seq_orin
+# ordering. This is a circular shift of the sync_long.cc template and matches
+# the first unique 64-sample block of the repeated sequence the user provided.
+LONG_TRAINING_ORIN = np.concatenate([LONG_TRAINING[31:], LONG_TRAINING[:31]]).astype(np.complex64)
+
 
 @dataclass
 class SyncLongConfig:
     samp_rate: float = 20e6
     expected_gap: int = 64
     with_freqoffset_search: bool = True
-    cfo_start_idx: int = -100
-    cfo_end_idx: int = 100
+    cfo_start_idx: int = -500
+    cfo_end_idx: int = 500
     threshold_scale: float = 0.7
     rms_stride: int = 30
     max_copy: int = 540 * 80
@@ -62,11 +67,85 @@ class SyncLongConfig:
     peak_search_max_len: int = 300
     peak_tol: int = 2
     peak_distance_from_peak: int = 4
+    long_training: Optional[np.ndarray] = None
 
 
 def load_complex64_file(path: str) -> np.ndarray:
     data = np.fromfile(path, dtype=np.complex64)
     return np.ascontiguousarray(data)
+
+
+def load_mat_file(path: str, samp_rate_in: float = 30.72e6, samp_rate_out: float = 20e6) -> np.ndarray:
+    """Load IQ data from a MATLAB .mat file and resample to the target rate."""
+    import scipy.io as sio
+    from scipy.signal import firwin, resample_poly
+    from math import gcd
+
+    mat = sio.loadmat(path)
+    data_keys = [key for key in mat.keys() if not key.startswith("_")]
+    if len(data_keys) != 1:
+        raise ValueError(f"Expected exactly one variable in .mat file, found: {data_keys}")
+
+    raw = np.asarray(mat[data_keys[0]]).flatten().astype(np.complex64)
+    up = int(round(samp_rate_out))
+    down = int(round(samp_rate_in))
+    g = gcd(up, down)
+    up //= g
+    down //= g
+
+    if up != down:
+        max_rate = max(up, down)
+        # Use an explicit low-pass FIR instead of SciPy's default window so the
+        # 30.72 -> 20 MHz conversion gets stronger stopband rejection.
+        num_taps = 20 * max_rate + 1
+        taps = firwin(
+            num_taps,
+            cutoff=1.0 / max_rate,
+            window=("kaiser", 8.6),
+        )
+        raw = resample_poly(raw, up, down, window=taps).astype(np.complex64)
+
+    return np.ascontiguousarray(raw)
+
+
+def save_long_corr_debug_mat(path: str, iq_data: np.ndarray, detection: Dict[str, object], capture: Dict[str, object]) -> str:
+    """Save sync-long-only debug data to a MATLAB .mat file."""
+    import scipy.io as sio
+
+    sorted_peaks = np.asarray(detection.get("sorted_peaks", []), dtype=np.int64)
+    corr_long = np.asarray(detection.get("corr_long", []), dtype=np.float32)
+    peak_values = corr_long[sorted_peaks] if len(sorted_peaks) else np.zeros((0,), dtype=np.float32)
+    pair_count = len(sorted_peaks) // 2
+    peak_pairs = sorted_peaks[: pair_count * 2].reshape(pair_count, 2) if pair_count else np.zeros((0, 2), dtype=np.int64)
+    frame_ids = np.arange(1, pair_count + 1, dtype=np.uint64)
+    lts_snr_db = np.asarray(capture.get("lts_snr_db", []), dtype=np.float32)
+
+    out_path = path if path.endswith(".mat") else path + ".mat"
+    sio.savemat(
+        out_path,
+        {
+            "iq_abs": np.abs(np.asarray(iq_data, dtype=np.complex64)).astype(np.float32),
+            "corr_long": corr_long,
+            "sorted_peaks": sorted_peaks,
+            "peak_values": peak_values.astype(np.float32),
+            "peak_pairs": peak_pairs,
+            "frame_ids": frame_ids,
+            "threshold": np.array([float(detection.get("threshold", 0.0))], dtype=np.float32),
+            "best_freq_hz": np.array([float(detection.get("best_freq_hz", 0.0))], dtype=np.float32),
+            "lts_snr_db": lts_snr_db,
+        },
+        do_compression=True,
+    )
+    return out_path
+
+
+def get_long_training_sequence(mode: str = "cc") -> np.ndarray:
+    mode_norm = str(mode).strip().lower()
+    if mode_norm in ("cc", "default", "sync_long_cc"):
+        return LONG_TRAINING
+    if mode_norm in ("orin", "long_seq_orin", "orig"):
+        return LONG_TRAINING_ORIN
+    raise ValueError(f"Unknown long training mode: {mode}")
 
 
 def get_freq_search_rng(
@@ -103,18 +182,43 @@ def get_best_cfo(sync_seq: np.ndarray, iq_data: np.ndarray, freq_search: Dict[st
     fft_sync_seq = np.fft.fft(sync_seq.astype(np.complex64), len(iq_data))
 
     sampled_freq_bins = freq_search["sampled_freq_bins"]
-    max_per_freq = np.zeros(len(sampled_freq_bins), dtype=np.float64)
+    if len(sampled_freq_bins) == 0:
+        best_corr = np.zeros((len(iq_data),), dtype=np.float32)
+        best_corr_phase = np.zeros((len(iq_data),), dtype=np.complex64)
+        best_freq_index = 0
+        return {
+            "best_corr": best_corr,
+            "best_corr_phase": best_corr_phase,
+            "best_freq_index": best_freq_index,
+        }
 
-    for idx, freq_bin in enumerate(sampled_freq_bins):
-        detector_res, _ = detector_original_seq(fft_iq_input, fft_sync_seq, int(freq_bin))
-        max_per_freq[idx] = float(np.max(detector_res)) if len(detector_res) else 0.0
+    chunk_size = 8
+    max_per_freq = np.full(len(sampled_freq_bins), -np.inf, dtype=np.float64)
+    best_freq_index = 0
+    best_corr = None
+    best_corr_phase = None
 
-    best_freq_index = int(np.argmax(max_per_freq)) if len(max_per_freq) else 0
-    best_corr, best_corr_phase = detector_original_seq(
-        fft_iq_input,
-        fft_sync_seq,
-        int(sampled_freq_bins[best_freq_index]) if len(sampled_freq_bins) else 0,
-    )
+    for start in range(0, len(sampled_freq_bins), chunk_size):
+        chunk_bins = sampled_freq_bins[start:start + chunk_size]
+        shifted = np.stack([np.roll(fft_sync_seq, int(freq_bin)) for freq_bin in chunk_bins], axis=0)
+        products = fft_iq_input[np.newaxis, :] * shifted
+        corr_phase_chunk = np.fft.ifft(products, axis=1)
+        corr_mag_chunk = np.abs(corr_phase_chunk)
+        chunk_max = corr_mag_chunk.max(axis=1)
+        max_per_freq[start:start + len(chunk_bins)] = chunk_max
+
+        local_idx = int(np.argmax(chunk_max))
+        if start == 0 or chunk_max[local_idx] > max_per_freq[best_freq_index]:
+            best_freq_index = start + local_idx
+            best_corr = corr_mag_chunk[local_idx].astype(np.float32, copy=False)
+            best_corr_phase = corr_phase_chunk[local_idx].astype(np.complex64, copy=False)
+
+    if best_corr is None or best_corr_phase is None:
+        best_corr, best_corr_phase = detector_original_seq(
+            fft_iq_input,
+            fft_sync_seq,
+            int(sampled_freq_bins[best_freq_index]),
+        )
     return {
         "best_corr": best_corr,
         "best_corr_phase": best_corr_phase,
@@ -213,6 +317,7 @@ def compute_lts_snr_db(iq_freq_corr: np.ndarray, peak1: int, peak2: int) -> Opti
 
 def detect_sync_long_frames(iq_data: np.ndarray, cfg: SyncLongConfig | None = None) -> Dict[str, object]:
     cfg = cfg or SyncLongConfig()
+    training_seq = np.asarray(cfg.long_training if cfg.long_training is not None else LONG_TRAINING, dtype=np.complex64)
     if len(iq_data) == 0:
         return {
             "corr_long": np.zeros((0,), dtype=np.float32),
@@ -225,12 +330,12 @@ def detect_sync_long_frames(iq_data: np.ndarray, cfg: SyncLongConfig | None = No
     if cfg.with_freqoffset_search:
         freq_search = get_freq_search_rng(
             len(iq_data),
-            len(LONG_TRAINING),
+            len(training_seq),
             cfg.cfo_start_idx,
             cfg.cfo_end_idx,
             sync_seq_rate=cfg.samp_rate,
         )
-        search_result = get_best_cfo(LONG_TRAINING, iq_data, freq_search)
+        search_result = get_best_cfo(training_seq, iq_data, freq_search)
         corr_long = np.asarray(search_result["best_corr"], dtype=np.float32)
         corr_long_phase = np.asarray(search_result["best_corr_phase"], dtype=np.complex64)
         best_freq_index = int(search_result["best_freq_index"])
@@ -240,14 +345,14 @@ def detect_sync_long_frames(iq_data: np.ndarray, cfg: SyncLongConfig | None = No
     else:
         fft_len = len(iq_data)
         fft_input = np.fft.fft(iq_data.astype(np.complex64), fft_len)
-        fft_seq = np.fft.fft(LONG_TRAINING.astype(np.complex64), fft_len)
+        fft_seq = np.fft.fft(training_seq, fft_len)
         corr_long_phase = np.fft.ifft(fft_input * fft_seq)
         corr_long = np.abs(corr_long_phase).astype(np.float32)
         shift_freq_bins = 0
         best_freq_hz = 0.0
 
     rms_iq = float(np.sqrt(np.mean(np.abs(iq_data[:: max(1, cfg.rms_stride)]) ** 2))) if len(iq_data) else 0.0
-    sequence_energy = float(np.sum(np.abs(LONG_TRAINING) ** 2))
+    sequence_energy = float(np.sum(np.abs(training_seq) ** 2))
     threshold = max(float(np.max(corr_long)) * cfg.threshold_scale, 5.0 * rms_iq * math.sqrt(sequence_energy))
 
     peak_indices = find_peaks_like_rust(corr_long, cfg.expected_gap - 4, threshold)
@@ -323,23 +428,22 @@ def build_sync_long_capture(iq_data: np.ndarray, detection: Dict[str, object], c
         if n_out < cfg.min_symbols * 64:
             continue
 
-        out = np.zeros((n_out,), dtype=np.complex64)
-        out_idx = 0
-        for rel in range(n_raw):
-            emit = rel < 128 or ((rel - 128) % 80) > 15
-            if not emit:
-                continue
-            if out_idx >= n_out:
-                break
-            abs_idx = frame_start + rel
-            out[out_idx] = iq_data_freq_corr[abs_idx] * np.exp(1j * abs_idx * cfo)
-            out_idx += 1
+        rel = np.arange(n_raw, dtype=np.int64)
+        emit_mask = (rel < 128) | ((rel - 128) % 80 > 15)
+        abs_indices = frame_start + rel[emit_mask]
+        if len(abs_indices) == 0:
+            continue
 
-        if out_idx < n_out:
-            n_out = (out_idx // 64) * 64
+        if len(abs_indices) < n_out:
+            n_out = (len(abs_indices) // 64) * 64
             if n_out == 0:
                 continue
-            out = out[:n_out]
+            abs_indices = abs_indices[:n_out]
+        else:
+            abs_indices = abs_indices[:n_out]
+
+        phases = np.exp(1j * abs_indices.astype(np.float64) * cfo).astype(np.complex64)
+        out = (iq_data_freq_corr[abs_indices] * phases).astype(np.complex64, copy=False)
 
         if n_out < cfg.min_symbols * 64:
             continue
