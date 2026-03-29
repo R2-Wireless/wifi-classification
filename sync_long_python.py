@@ -5,9 +5,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Dict, List, Optional
+import os
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from scipy.fft import fft as _scipy_fft
+from scipy.fft import ifft as _scipy_ifft
+
+
+_FFT_WORKERS = int(os.environ.get("SYNC_LONG_FFT_WORKERS", "-1"))
+_CFO_TILE_SIZE = max(1, int(os.environ.get("SYNC_LONG_CFO_TILE", "4")))
+_CFO_BANK_CACHE: Dict[Tuple[int, bytes, bytes], "CFOFilterBank"] = {}
+
+
+def _fft(x: np.ndarray, n: Optional[int] = None, axis: int = -1) -> np.ndarray:
+    return _scipy_fft(x, n=n, axis=axis, workers=_FFT_WORKERS)
+
+
+def _ifft(x: np.ndarray, n: Optional[int] = None, axis: int = -1) -> np.ndarray:
+    return _scipy_ifft(x, n=n, axis=axis, workers=_FFT_WORKERS)
+
+
+def _as_complex64(x: np.ndarray) -> np.ndarray:
+    return np.asarray(x, dtype=np.complex64)
 
 
 LONG_TRAINING = np.array([
@@ -56,8 +76,8 @@ class SyncLongConfig:
     samp_rate: float = 20e6
     expected_gap: int = 64
     with_freqoffset_search: bool = True
-    cfo_start_idx: int = -500
-    cfo_end_idx: int = 500
+    cfo_start_idx: int = -200
+    cfo_end_idx: int = 200
     threshold_scale: float = 0.7
     rms_stride: int = 30
     max_copy: int = 540 * 80
@@ -75,18 +95,11 @@ def load_complex64_file(path: str) -> np.ndarray:
     return np.ascontiguousarray(data)
 
 
-def load_mat_file(path: str, samp_rate_in: float = 30.72e6, samp_rate_out: float = 20e6) -> np.ndarray:
-    """Load IQ data from a MATLAB .mat file and resample to the target rate."""
-    import scipy.io as sio
+def resample_complex64(raw: np.ndarray, samp_rate_in: float, samp_rate_out: float = 20e6) -> np.ndarray:
     from scipy.signal import firwin, resample_poly
     from math import gcd
 
-    mat = sio.loadmat(path)
-    data_keys = [key for key in mat.keys() if not key.startswith("_")]
-    if len(data_keys) != 1:
-        raise ValueError(f"Expected exactly one variable in .mat file, found: {data_keys}")
-
-    raw = np.asarray(mat[data_keys[0]]).flatten().astype(np.complex64)
+    raw = np.asarray(raw, dtype=np.complex64)
     up = int(round(samp_rate_out))
     down = int(round(samp_rate_in))
     g = gcd(up, down)
@@ -96,7 +109,7 @@ def load_mat_file(path: str, samp_rate_in: float = 30.72e6, samp_rate_out: float
     if up != down:
         max_rate = max(up, down)
         # Use an explicit low-pass FIR instead of SciPy's default window so the
-        # 30.72 -> 20 MHz conversion gets stronger stopband rejection.
+        # resampling path gets stronger stopband rejection.
         num_taps = 20 * max_rate + 1
         taps = firwin(
             num_taps,
@@ -106,6 +119,25 @@ def load_mat_file(path: str, samp_rate_in: float = 30.72e6, samp_rate_out: float
         raw = resample_poly(raw, up, down, window=taps).astype(np.complex64)
 
     return np.ascontiguousarray(raw)
+
+
+def load_iq_file(path: str, samp_rate_in: float = 40e6, samp_rate_out: float = 20e6) -> np.ndarray:
+    """Load raw complex64 IQ data and resample to the target rate."""
+    raw = load_complex64_file(path)
+    return resample_complex64(raw, samp_rate_in=samp_rate_in, samp_rate_out=samp_rate_out)
+
+
+def load_mat_file(path: str, samp_rate_in: float = 30.72e6, samp_rate_out: float = 20e6) -> np.ndarray:
+    """Load IQ data from a MATLAB .mat file and resample to the target rate."""
+    import scipy.io as sio
+
+    mat = sio.loadmat(path)
+    data_keys = [key for key in mat.keys() if not key.startswith("_")]
+    if len(data_keys) != 1:
+        raise ValueError(f"Expected exactly one variable in .mat file, found: {data_keys}")
+
+    raw = np.asarray(mat[data_keys[0]]).flatten().astype(np.complex64)
+    return resample_complex64(raw, samp_rate_in=samp_rate_in, samp_rate_out=samp_rate_out)
 
 
 def save_long_corr_debug_mat(path: str, iq_data: np.ndarray, detection: Dict[str, object], capture: Dict[str, object]) -> str:
@@ -154,10 +186,10 @@ def get_freq_search_rng(
     freq_start_steps: int,
     freq_end_steps: int,
     sync_seq_rate: float = 20e6,
-    resolution_parameter: float = 2.0,
+    resolution_parameter: float = 4.0,
 ) -> Dict[str, np.ndarray]:
     sync_duration_sec = sync_seq_len / sync_seq_rate
-    bin_width_hz = sync_seq_rate / data_len
+    bin_width_hz = 0.5*sync_seq_rate / data_len
     sampled_freq_step = max(1, round(1 / resolution_parameter / sync_duration_sec / bin_width_hz))
     sampled_freq_bins = np.arange(freq_start_steps, freq_end_steps + 1, dtype=np.int64) * sampled_freq_step
     return {
@@ -173,57 +205,92 @@ def detector_original_seq(
     shift_freq: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     fft_seq_shift = np.roll(fft_orig_seq, int(shift_freq))
-    corr_phase = np.fft.ifft(fft_input * fft_seq_shift)
+    corr_phase = _ifft(fft_input * fft_seq_shift)
     return np.abs(corr_phase), corr_phase
 
 
-def get_best_cfo(sync_seq: np.ndarray, iq_data: np.ndarray, freq_search: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-    fft_iq_input = np.fft.fft(iq_data.astype(np.complex64))
-    fft_sync_seq = np.fft.fft(sync_seq.astype(np.complex64), len(iq_data))
+@dataclass
+class CFOFilterBank:
+    fft_len: int
+    freq_search: Dict[str, np.ndarray]
+    templates: np.ndarray
+    tile_size: int = _CFO_TILE_SIZE
 
-    sampled_freq_bins = freq_search["sampled_freq_bins"]
-    if len(sampled_freq_bins) == 0:
-        best_corr = np.zeros((len(iq_data),), dtype=np.float32)
-        best_corr_phase = np.zeros((len(iq_data),), dtype=np.complex64)
+    def correlate_tiled(self, iq_data: np.ndarray) -> Dict[str, np.ndarray]:
+        fft_iq_input = _as_complex64(_fft(iq_data.astype(np.complex64), n=self.fft_len))
+        sampled_freq_bins = self.freq_search["sampled_freq_bins"]
+        if len(sampled_freq_bins) == 0:
+            best_corr = np.zeros((self.fft_len,), dtype=np.float32)
+            best_corr_phase = np.zeros((self.fft_len,), dtype=np.complex64)
+            return {
+                "best_corr": best_corr,
+                "best_corr_phase": best_corr_phase,
+                "best_freq_index": 0,
+            }
+
+        best_mag = -np.inf
         best_freq_index = 0
+        best_corr = None
+        best_corr_phase = None
+
+        for start in range(0, len(sampled_freq_bins), self.tile_size):
+            stop = min(start + self.tile_size, len(sampled_freq_bins))
+            products = fft_iq_input[np.newaxis, :] * self.templates[start:stop]
+            corr_phase_chunk = _as_complex64(_ifft(products, axis=1))
+            corr_mag_chunk = np.abs(corr_phase_chunk).astype(np.float32, copy=False)
+            chunk_max = corr_mag_chunk.max(axis=1)
+            local_idx = int(np.argmax(chunk_max))
+            local_mag = float(chunk_max[local_idx])
+            if best_corr is None or local_mag > best_mag:
+                best_mag = local_mag
+                best_freq_index = start + local_idx
+                best_corr = corr_mag_chunk[local_idx]
+                best_corr_phase = corr_phase_chunk[local_idx]
+
+        if best_corr is None or best_corr_phase is None:
+            best_corr = np.zeros((self.fft_len,), dtype=np.float32)
+            best_corr_phase = np.zeros((self.fft_len,), dtype=np.complex64)
         return {
             "best_corr": best_corr,
             "best_corr_phase": best_corr_phase,
             "best_freq_index": best_freq_index,
         }
 
-    chunk_size = 8
-    max_per_freq = np.full(len(sampled_freq_bins), -np.inf, dtype=np.float64)
-    best_freq_index = 0
-    best_corr = None
-    best_corr_phase = None
 
-    for start in range(0, len(sampled_freq_bins), chunk_size):
-        chunk_bins = sampled_freq_bins[start:start + chunk_size]
-        shifted = np.stack([np.roll(fft_sync_seq, int(freq_bin)) for freq_bin in chunk_bins], axis=0)
-        products = fft_iq_input[np.newaxis, :] * shifted
-        corr_phase_chunk = np.fft.ifft(products, axis=1)
-        corr_mag_chunk = np.abs(corr_phase_chunk)
-        chunk_max = corr_mag_chunk.max(axis=1)
-        max_per_freq[start:start + len(chunk_bins)] = chunk_max
+def get_or_build_cfo_filter_bank(
+    sync_seq: np.ndarray,
+    fft_len: int,
+    freq_search: Dict[str, np.ndarray],
+    tile_size: int = _CFO_TILE_SIZE,
+) -> CFOFilterBank:
+    sampled_freq_bins = np.asarray(freq_search["sampled_freq_bins"], dtype=np.int64)
+    training_seq = np.asarray(sync_seq, dtype=np.complex64)
+    cache_key = (int(fft_len), training_seq.tobytes(), sampled_freq_bins.tobytes())
+    bank = _CFO_BANK_CACHE.get(cache_key)
+    if bank is not None:
+        bank.tile_size = max(1, int(tile_size))
+        return bank
 
-        local_idx = int(np.argmax(chunk_max))
-        if start == 0 or chunk_max[local_idx] > max_per_freq[best_freq_index]:
-            best_freq_index = start + local_idx
-            best_corr = corr_mag_chunk[local_idx].astype(np.float32, copy=False)
-            best_corr_phase = corr_phase_chunk[local_idx].astype(np.complex64, copy=False)
+    fft_sync_seq = _as_complex64(_fft(training_seq, n=fft_len))
+    if len(sampled_freq_bins) == 0:
+        templates = np.zeros((0, fft_len), dtype=np.complex64)
+    else:
+        freq_idx = np.arange(fft_len, dtype=np.int64)[np.newaxis, :]
+        shifted_idx = (freq_idx - sampled_freq_bins[:, np.newaxis]) % fft_len
+        templates = _as_complex64(fft_sync_seq[shifted_idx])
+    bank = CFOFilterBank(
+        fft_len=int(fft_len),
+        freq_search=freq_search,
+        templates=templates,
+        tile_size=max(1, int(tile_size)),
+    )
+    _CFO_BANK_CACHE[cache_key] = bank
+    return bank
 
-    if best_corr is None or best_corr_phase is None:
-        best_corr, best_corr_phase = detector_original_seq(
-            fft_iq_input,
-            fft_sync_seq,
-            int(sampled_freq_bins[best_freq_index]),
-        )
-    return {
-        "best_corr": best_corr,
-        "best_corr_phase": best_corr_phase,
-        "best_freq_index": best_freq_index,
-    }
+
+def get_best_cfo(sync_seq: np.ndarray, iq_data: np.ndarray, freq_search: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    bank = get_or_build_cfo_filter_bank(sync_seq, len(iq_data), freq_search)
+    return bank.correlate_tiled(iq_data)
 
 
 def find_peaks_like_rust(normalized_corr: np.ndarray, expected_gap_base: int, threshold_blue: float) -> np.ndarray:
@@ -344,9 +411,9 @@ def detect_sync_long_frames(iq_data: np.ndarray, cfg: SyncLongConfig | None = No
         best_freq_hz = float(freq_search["freq_hz"][best_freq_index]) if len(sampled_bins) else 0.0
     else:
         fft_len = len(iq_data)
-        fft_input = np.fft.fft(iq_data.astype(np.complex64), fft_len)
-        fft_seq = np.fft.fft(training_seq, fft_len)
-        corr_long_phase = np.fft.ifft(fft_input * fft_seq)
+        fft_input = _fft(iq_data.astype(np.complex64), n=fft_len)
+        fft_seq = _fft(training_seq, n=fft_len)
+        corr_long_phase = _ifft(fft_input * fft_seq)
         corr_long = np.abs(corr_long_phase).astype(np.float32)
         shift_freq_bins = 0
         best_freq_hz = 0.0
@@ -373,8 +440,8 @@ def build_sync_long_capture(iq_data: np.ndarray, detection: Dict[str, object], c
     sorted_peaks = np.asarray(detection["sorted_peaks"], dtype=np.int64)
     shift_freq_bins = int(detection.get("shift_freq_bins", 0))
 
-    fft_input = np.fft.fft(iq_data.astype(np.complex64))
-    iq_data_freq_corr = np.fft.ifft(np.roll(fft_input, -shift_freq_bins)).astype(np.complex64)
+    fft_input = _fft(iq_data.astype(np.complex64))
+    iq_data_freq_corr = _ifft(np.roll(fft_input, -shift_freq_bins)).astype(np.complex64)
 
     norm_factor = 4.0 * float(np.mean(np.abs(iq_data_freq_corr))) if len(iq_data_freq_corr) else 1.0
     if norm_factor > 0:

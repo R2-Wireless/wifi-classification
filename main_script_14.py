@@ -36,19 +36,40 @@ import re
 import math
 from argparse import ArgumentParser
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import Optional
 import ieee802_11
 import pmt
 from sync_long_python import (
     SyncLongConfig,
     build_sync_long_capture,
     detect_sync_long_frames,
+    get_freq_search_rng,
+    get_or_build_cfo_filter_bank,
     get_long_training_sequence,
     load_complex64_file,
+    load_iq_file,
     load_mat_file,
     save_long_corr_debug_mat,
 )
 from wifi_scan_result import build_wifi_scan_result
 from wifi_scan_result import classify_wifi
+
+
+_WIRESHARK_MANUF_CACHE = None
+
+
+@dataclass
+class SyncLongPrepResult:
+    capture: dict
+    detection: dict
+    prep_timing_rows: list
+    chunk_logs: list
+    chunk_index: int = 0
+    chunk_count: int = 1
+    chunk_start: int = 0
+    chunk_end: int = 0
+    total_samples: int = 0
 
 
 
@@ -57,6 +78,9 @@ from wifi_scan_result import classify_wifi
 # =============================================================================
 
 def load_wireshark_manuf(path="/usr/share/wireshark/manuf"):
+    global _WIRESHARK_MANUF_CACHE
+    if _WIRESHARK_MANUF_CACHE is not None:
+        return _WIRESHARK_MANUF_CACHE
     mapping = {}
     try:
         with open(path, "r", errors="ignore") as f:
@@ -75,6 +99,7 @@ def load_wireshark_manuf(path="/usr/share/wireshark/manuf"):
                     mapping[prefix] = vendor
     except FileNotFoundError:
         pass
+    _WIRESHARK_MANUF_CACHE = mapping
     return mapping
 
 
@@ -501,7 +526,7 @@ class message_handler(gr.sync_block):
     """Handle decoded MAC PDUs with detailed statistics tracking"""
 
     def __init__(self, pcap_writer: PCAPWriter, center_freq_hz: float, samp_rate_hz: float,
-                 verbose: bool = True):
+                 verbose: bool = True, stop_after_first_good: bool = False, on_first_good=None):
         gr.sync_block.__init__(self, name="message_handler", in_sig=None, out_sig=None)
 
         self.pcap = pcap_writer
@@ -516,6 +541,10 @@ class message_handler(gr.sync_block):
         self.total_msg_time_ns = 0
         self.total_msg_count = 0
         self.decoded_frames = []
+        self.stop_after_first_good = bool(stop_after_first_good)
+        self.on_first_good = on_first_good
+        self.good_fcs_count = 0
+        self.stop_requested = False
 
         self.message_port_register_in(pmt.intern("in"))
         self.set_msg_handler(pmt.intern("in"), self.handle_msg)
@@ -680,6 +709,14 @@ class message_handler(gr.sync_block):
             )
             self._add_stage_time("pcap_write", time.perf_counter_ns() - t0)
             self._record_decoded_frame(meta, fcs_ok, data, fc_info, roles, ssid, None)
+            self.good_fcs_count += 1
+            if self.stop_after_first_good and not self.stop_requested:
+                self.stop_requested = True
+                if self.on_first_good is not None:
+                    try:
+                        self.on_first_good()
+                    except Exception:
+                        pass
 
         except Exception as e:
             self.stats.add_failure(f"Exception: {str(e)[:50]}")
@@ -779,9 +816,12 @@ class TagInjectBlock(gr.sync_block):
             in_sig=[np.complex64],
             out_sig=[np.complex64],
         )
+        self.set_tags(tags)
+        self.set_tag_propagation_policy(gr.TPP_ALL_TO_ALL)
+
+    def set_tags(self, tags: list):
         self._pending = sorted(tags, key=lambda t: t["offset"])
         self._pending_idx = 0
-        self.set_tag_propagation_policy(gr.TPP_ALL_TO_ALL)
 
     def work(self, input_items, output_items):
         in0 = input_items[0]
@@ -815,12 +855,25 @@ class TagInjectBlock(gr.sync_block):
 
 
 class wifi_rx_sync_long_only(gr.top_block):
-    def __init__(self, capture, output_pcap, verbose=True, freq=5.180e9, samp_rate=20e6):
+    def __init__(
+        self,
+        capture,
+        output_pcap,
+        verbose=True,
+        freq=5.180e9,
+        #freq=2.202e9,
+        samp_rate=20e6,
+        #samp_rate=5.5e6,
+        stop_after_first_good=False,
+        use_throttle=True,
+    ):
         gr.top_block.__init__(self, "WiFi RX Sync Long Only")
 
         self.freq = freq
         self.samp_rate = samp_rate
         self.chan_est = ieee802_11.LS
+        #self.chan_est = ieee802_11.LMS
+        #self.chan_est = ieee802_11.STA
 
         self.pcap = PCAPWriter(output_pcap)
         self.msg_handler = message_handler(
@@ -828,9 +881,39 @@ class wifi_rx_sync_long_only(gr.top_block):
             center_freq_hz=self.freq,
             samp_rate_hz=self.samp_rate,
             verbose=verbose,
+            stop_after_first_good=stop_after_first_good,
+            on_first_good=self._handle_first_good_frame,
         )
+        self.vector_source = blocks.vector_source_c([], False, 1, [])
+        self.tag_inject = TagInjectBlock([])
+        self.stream_to_vector = blocks.stream_to_vector(gr.sizeof_gr_complex, 64)
+        self.fft_block = fft.fft_vcc(64, True, window.rectangular(64), True, 1)
+        self.stream_to_vector.set_tag_propagation_policy(gr.TPP_ALL_TO_ALL)
+        self.fft_block.set_tag_propagation_policy(gr.TPP_ALL_TO_ALL)
+        self.frame_equalizer = ieee802_11.frame_equalizer(
+            ieee802_11.Equalizer(self.chan_est), self.freq, self.samp_rate, True, True
+        )
+        self.decode_mac = ieee802_11.decode_mac(True, True)
 
-        samples = np.asarray(capture["samples"], dtype=np.complex64)
+        if use_throttle:
+            self.throttle = blocks.throttle(gr.sizeof_gr_complex, self.samp_rate, True)
+            self.connect((self.vector_source, 0), (self.throttle, 0))
+            replay_src = self.throttle
+        else:
+            self.throttle = None
+            replay_src = self.vector_source
+        self.connect((replay_src, 0), (self.tag_inject, 0))
+        self.connect((self.tag_inject, 0), (self.stream_to_vector, 0))
+        self.connect((self.stream_to_vector, 0), (self.fft_block, 0))
+        self.connect((self.fft_block, 0), (self.frame_equalizer, 0))
+        self.connect((self.frame_equalizer, 0), (self.decode_mac, 0))
+
+        self.msg_connect((self.decode_mac, "out"), (self.msg_handler, "in"))
+        self.msg_connect((self.decode_mac, "out_fail"), (self.msg_handler, "in"))
+        self.load_capture(capture)
+
+    @staticmethod
+    def _capture_to_inject_tags(capture):
         inject_tags = []
         for idx, key in enumerate(capture["tag_keys"]):
             tag_type = str(capture["tag_value_types"][idx])
@@ -841,47 +924,18 @@ class wifi_rx_sync_long_only(gr.top_block):
                 "value_f64": float(capture["tag_values_f64"][idx]) if tag_type == "f64" else 0.0,
                 "value_u64": int(capture["tag_values_u64"][idx]) if tag_type == "u64" else 0,
             })
+        return inject_tags
 
-        self._tmpfile = tempfile.NamedTemporaryFile(
-            suffix=".bin", delete=False, prefix="sync_long_only_"
-        )
-        samples.tofile(self._tmpfile)
-        self._tmpfile.flush()
-        self._tmpfile.close()
+    def load_capture(self, capture):
+        samples = np.asarray(capture["samples"], dtype=np.complex64)
+        inject_tags = self._capture_to_inject_tags(capture)
+        self.vector_source.set_data(samples.tolist(), [])
+        self.vector_source.rewind()
+        self.tag_inject.set_tags(inject_tags)
 
-        self.file_source = blocks.file_source(
-            gr.sizeof_gr_complex,
-            self._tmpfile.name,
-            False,
-            0,
-            0,
-        )
-        self.file_source.set_begin_tag(pmt.PMT_NIL)
-        self.throttle = blocks.throttle(gr.sizeof_gr_complex, self.samp_rate, True)
-        self.tag_inject = TagInjectBlock(inject_tags)
-        self.stream_to_vector = blocks.stream_to_vector(gr.sizeof_gr_complex, 64)
-        self.fft_block = fft.fft_vcc(64, True, window.rectangular(64), True, 1)
-        self.stream_to_vector.set_tag_propagation_policy(gr.TPP_ALL_TO_ALL)
-        self.fft_block.set_tag_propagation_policy(gr.TPP_ALL_TO_ALL)
-        self.frame_equalizer = ieee802_11.frame_equalizer(
-            ieee802_11.Equalizer(self.chan_est), self.freq, self.samp_rate, True, True
-        )
-        self.decode_mac = ieee802_11.decode_mac(True, True)
-
-        self.connect((self.file_source, 0), (self.throttle, 0))
-        self.connect((self.throttle, 0), (self.tag_inject, 0))
-        self.connect((self.tag_inject, 0), (self.stream_to_vector, 0))
-        self.connect((self.stream_to_vector, 0), (self.fft_block, 0))
-        self.connect((self.fft_block, 0), (self.frame_equalizer, 0))
-        self.connect((self.frame_equalizer, 0), (self.decode_mac, 0))
-
-        self.msg_connect((self.decode_mac, "out"), (self.msg_handler, "in"))
-        self.msg_connect((self.decode_mac, "out_fail"), (self.msg_handler, "in"))
-
-    def __del__(self):
+    def _handle_first_good_frame(self):
         try:
-            if hasattr(self, "_tmpfile") and os.path.exists(self._tmpfile.name):
-                os.unlink(self._tmpfile.name)
+            self.stop()
         except Exception:
             pass
 
@@ -1029,7 +1083,7 @@ def argument_parser():
     parser = ArgumentParser()
     parser.add_argument(
         "input_file",
-        help="Input IQ file (.cfile complex64, or .mat MATLAB complex IQ)",
+        help="Input IQ file (.cfile complex64 at 20 MHz, .iq complex64 at 40 MHz resampled to 20 MHz, or .mat MATLAB complex IQ)",
     )
     parser.add_argument("output_pcap", nargs="?", default="/tmp/wifi_output_radiotap.pcap",
                         help="Output PCAP file (radiotap)")
@@ -1039,7 +1093,8 @@ def argument_parser():
         type=float,
         default=None,
         help=(
-            "Input sample rate in Hz for .mat files (default: 30.72e6). "
+            "Input sample rate in Hz for .mat/.iq files. "
+            "Defaults: .mat -> 30.72e6, .iq -> 40e6. "
             "The data is resampled to 20 MHz before processing. Ignored for .cfile inputs."
         ),
     )
@@ -1092,13 +1147,13 @@ def argument_parser():
     parser.add_argument(
         "--sync-long-cfo-start",
         type=int,
-        default=-100,
+        default=SyncLongConfig.cfo_start_idx,
         help="Start CFO search step for --sync-long-only mode (MATLAB-compatible units).",
     )
     parser.add_argument(
         "--sync-long-cfo-end",
         type=int,
-        default=100,
+        default=SyncLongConfig.cfo_end_idx,
         help="End CFO search step for --sync-long-only mode (MATLAB-compatible units).",
     )
     parser.add_argument(
@@ -1117,6 +1172,36 @@ def argument_parser():
             "In --sync-long-only mode, save long-correlation debug data to a MATLAB .mat file "
             "(path with or without .mat suffix)."
         ),
+    )
+    parser.add_argument(
+        "--sync-long-two-pass-halves",
+        action="store_true",
+        default=False,
+        help=(
+            "In --sync-long-only mode, search the first half of the IQ buffer first, with overlap, "
+            "and only fall back to the second half if the first half produces no good-FCS decode."
+        ),
+    )
+    parser.add_argument(
+        "--sync-long-chunk-samples",
+        type=int,
+        default=None,
+        help=(
+            "In --sync-long-only mode, scan the capture front-to-back in chunks of this many raw IQ samples "
+            "before long sync. Each chunk includes automatic overlap so frames near chunk boundaries are still seen."
+        ),
+    )
+    parser.add_argument(
+        "--stop-after-first-good",
+        action="store_true",
+        default=False,
+        help="Stop replay as soon as the first frame with fcs_ok=True is decoded.",
+    )
+    parser.add_argument(
+        "--sync-long-no-throttle",
+        action="store_true",
+        default=False,
+        help="Disable the replay throttle in --sync-long-only mode so timing reflects raw processing speed.",
     )
     return parser
 
@@ -1266,8 +1351,16 @@ def _print_gr_stage_perf_tables(tb, file_total_ns: int, run_ns: int, run_non_han
     print("[timing] +------------------------------+------------+----------+----------+----------+")
 
 
-def _prepare_python_sync_long_capture(options):
-    cfg = SyncLongConfig(
+def _append_prep_timing(prep_rows, name: str, start_ns: int, extra: str = ""):
+    prep_rows.append({
+        "name": name,
+        "ns": time.perf_counter_ns() - start_ns,
+        "extra": extra,
+    })
+
+
+def _build_sync_long_cfg(options) -> SyncLongConfig:
+    return SyncLongConfig(
         samp_rate=20e6,
         expected_gap=64,
         with_freqoffset_search=not options.sync_long_no_cfo_search,
@@ -1275,7 +1368,59 @@ def _prepare_python_sync_long_capture(options):
         cfo_end_idx=int(options.sync_long_cfo_end),
         long_training=get_long_training_sequence(options.long_training_mode),
     )
+
+
+def _probe_input_sample_count(input_path: str, samp_rate_in: Optional[float] = None) -> Optional[int]:
+    if input_path.lower().endswith((".cfile", ".iq")):
+        try:
+            raw_len = os.path.getsize(input_path) // np.dtype(np.complex64).itemsize
+            if input_path.lower().endswith(".iq"):
+                from math import gcd
+
+                samp_rate_in_eff = float(samp_rate_in) if samp_rate_in else 40e6
+                samp_rate_out = 20e6
+                up = int(round(samp_rate_out))
+                down = int(round(float(samp_rate_in_eff)))
+                g = gcd(up, down)
+                up //= g
+                down //= g
+                if up == down:
+                    return raw_len
+                return int((raw_len * up + down - 1) // down)
+            return raw_len
+        except OSError:
+            return None
+    if input_path.lower().endswith(".mat"):
+        try:
+            import scipy.io as sio
+            from math import gcd
+
+            meta = sio.whosmat(input_path)
+            data_vars = [item for item in meta if not str(item[0]).startswith("_")]
+            if len(data_vars) != 1:
+                return None
+
+            _, shape, _ = data_vars[0]
+            raw_len = int(np.prod(shape, dtype=np.int64))
+            samp_rate_in = float(samp_rate_in) if samp_rate_in else 30.72e6
+            samp_rate_out = 20e6
+            up = int(round(samp_rate_out))
+            down = int(round(float(samp_rate_in)))
+            g = gcd(up, down)
+            up //= g
+            down //= g
+            if up == down:
+                return raw_len
+            return int((raw_len * up + down - 1) // down)
+        except Exception:
+            return None
+    return None
+
+
+def _load_sync_long_iq_data(options, prep_rows):
+    cfg = _build_sync_long_cfg(options)
     input_path = options.input_file
+    t0 = time.perf_counter_ns()
     if input_path.lower().endswith(".mat"):
         samp_rate_in = float(options.samp_rate_in) if options.samp_rate_in else 30.72e6
         print(
@@ -1283,31 +1428,162 @@ def _prepare_python_sync_long_capture(options):
             "resampling to 20.00 MHz)..."
         )
         iq_data = load_mat_file(input_path, samp_rate_in=samp_rate_in, samp_rate_out=20e6)
+    elif input_path.lower().endswith(".iq"):
+        samp_rate_in = float(options.samp_rate_in) if options.samp_rate_in else 40e6
+        print(
+            f"[sync_long_only] Loading .iq file (input rate={samp_rate_in / 1e6:.2f} MHz, "
+            "resampling to 20.00 MHz)..."
+        )
+        iq_data = load_iq_file(input_path, samp_rate_in=samp_rate_in, samp_rate_out=20e6)
     else:
         iq_data = load_complex64_file(input_path)
+    _append_prep_timing(prep_rows, "load_iq", t0, f"samples={len(iq_data):,}")
+    return cfg, iq_data, input_path
 
-    print(f"[sync_long_only] Loaded {len(iq_data):,} IQ samples from {input_path}")
-    detection = detect_sync_long_frames(iq_data, cfg)
-    capture = build_sync_long_capture(iq_data, detection, cfg)
+
+def _build_sync_long_chunk_plan(total_samples: int, cfg: SyncLongConfig, options):
+    if total_samples <= 0:
+        return [(0, 0)]
+    overlap = max(int(cfg.max_copy + 64), int(cfg.max_copy + cfg.peak_search_safe_len))
+
+    chunk_samples = getattr(options, "sync_long_chunk_samples", None)
+    if chunk_samples is not None:
+        chunk_samples = int(chunk_samples)
+        if chunk_samples > 0 and chunk_samples < total_samples:
+            chunks = []
+            chunk_base_start = 0
+            while chunk_base_start < total_samples:
+                chunk_base_end = min(total_samples, chunk_base_start + chunk_samples)
+                chunk_end = min(total_samples, chunk_base_end + overlap)
+                chunks.append((chunk_base_start, chunk_end))
+                if chunk_base_end >= total_samples:
+                    break
+                chunk_base_start = chunk_base_end
+            return chunks
+
+    if not options.sync_long_two_pass_halves:
+        return [(0, total_samples)]
+
+    mid = total_samples // 2
+    return [
+        (0, min(total_samples, mid + overlap)),
+        (max(0, mid - overlap), total_samples),
+    ]
+
+
+def _prepare_python_sync_long_capture_for_chunk(
+    options,
+    cfg,
+    iq_data,
+    chunk_start,
+    chunk_end,
+    prep_rows,
+    chunk_index,
+    chunk_count,
+):
+    iq_chunk = iq_data[chunk_start:chunk_end]
+    print(
+        "[sync_long_only] "
+        f"prep chunk {chunk_index}/{chunk_count}: "
+        f"samples[{chunk_start:,}:{chunk_end:,}] ({len(iq_chunk):,} samples)"
+    )
+    t0 = time.perf_counter_ns()
+    detection = detect_sync_long_frames(iq_chunk, cfg)
+    _append_prep_timing(
+        prep_rows,
+        f"detect_sync_long_frames[{chunk_index}]",
+        t0,
+        f"chunk_samples={len(iq_chunk):,}",
+    )
+    t0 = time.perf_counter_ns()
+    capture = build_sync_long_capture(iq_chunk, detection, cfg)
+    _append_prep_timing(
+        prep_rows,
+        f"build_sync_long_capture[{chunk_index}]",
+        t0,
+        f"frame_count={capture.get('frame_count', 0)}",
+    )
+
     if options.dump_long_corr_mat:
-        mat_path = save_long_corr_debug_mat(options.dump_long_corr_mat, iq_data, detection, capture)
+        t0 = time.perf_counter_ns()
+        mat_path = save_long_corr_debug_mat(
+            options.dump_long_corr_mat,
+            iq_chunk,
+            detection,
+            capture,
+        )
+        _append_prep_timing(
+            prep_rows,
+            f"save_long_corr_debug_mat[{chunk_index}]",
+            t0,
+            mat_path,
+        )
         print(f"[sync_long_only] long correlation debug saved to: {mat_path}")
+
     print(
         "[sync_long_only] "
         f"training={options.long_training_mode}  "
+        f"chunk={chunk_index}/{chunk_count}  "
         f"best_freq={capture.get('best_freq_hz', 0.0):+.1f} Hz  "
         f"threshold={capture.get('threshold', 0.0):.3f}  "
         f"peak_count={len(capture.get('sorted_peaks', []))}  "
         f"frame_count={capture.get('frame_count', 0)}  "
-        f"packed_samples={len(capture['samples']):,}"
+        f"packed_samples={len(capture.get('samples', [])):,}"
     )
-    return capture, detection
+    return SyncLongPrepResult(
+        capture=capture,
+        detection=detection,
+        prep_timing_rows=list(prep_rows),
+        chunk_logs=[{
+            "chunk_index": chunk_index,
+            "chunk_count": chunk_count,
+            "chunk_start": chunk_start,
+            "chunk_end": chunk_end,
+            "capture": capture,
+            "detection": detection,
+        }],
+        chunk_index=chunk_index,
+        chunk_count=chunk_count,
+        chunk_start=chunk_start,
+        chunk_end=chunk_end,
+        total_samples=len(iq_data),
+    )
+
+
+def _print_sync_long_prep_timing(prep_rows):
+    if not prep_rows:
+        return
+    total_ns = sum(int(row.get("ns", 0)) for row in prep_rows)
+    print("\n[timing] Sync-Long Prep Breakdown")
+    print("[timing] +------------------------------+------------+----------+---------------------------+")
+    print("[timing] | step                         |    ms      |   pct    | note                      |")
+    print("[timing] +------------------------------+------------+----------+---------------------------+")
+    for row in prep_rows:
+        ns = int(row.get("ns", 0))
+        ms = ns / 1e6
+        pct = (100.0 * ns / total_ns) if total_ns else 0.0
+        note = str(row.get("extra", "") or "")
+        if len(note) > 25:
+            note = note[:22] + "..."
+        print(f"[timing] | {row['name']:<28} | {ms:10.3f} | {pct:7.2f}% | {note:<25} |")
+    print("[timing] +------------------------------+------------+----------+---------------------------+")
+    print(f"[timing] | {'prep_total':<28} | {total_ns / 1e6:10.3f} | {100.00:7.2f}% | {'':<25} |")
+    print("[timing] +------------------------------+------------+----------+---------------------------+")
 
 
 def _mat_to_tmp_cfile(mat_path: str, samp_rate_in: float = 30.72e6) -> str:
     """Convert a .mat IQ file to a temporary complex64 .cfile at 20 MHz."""
     iq_data = load_mat_file(mat_path, samp_rate_in=samp_rate_in, samp_rate_out=20e6)
     tmp = tempfile.NamedTemporaryFile(suffix=".cfile", delete=False, prefix="mat_iq_")
+    iq_data.tofile(tmp)
+    tmp.close()
+    return tmp.name
+
+
+def _iq_to_tmp_cfile(iq_path: str, samp_rate_in: float = 40e6) -> str:
+    """Convert a .iq complex64 file to a temporary complex64 .cfile at 20 MHz."""
+    iq_data = load_iq_file(iq_path, samp_rate_in=samp_rate_in, samp_rate_out=20e6)
+    tmp = tempfile.NamedTemporaryFile(suffix=".cfile", delete=False, prefix="iq_iq_")
     iq_data.tofile(tmp)
     tmp.close()
     return tmp.name
@@ -1362,42 +1638,47 @@ def _print_wifi_scan_summary(scan_result):
 
     if not scan_result.frames:
         print("[scan_result] No frame details available.")
-        return
+    else:
+        print("[scan_result] +----+-----+----------+----------+----------+----------+--------+---------+--------------------------+------------------+--------------------------+------------------+")
+        print("[scan_result] | id | fcs | peak1    | peak2    | p1_mag   | p2_mag   | snr_db | lts_snr | type                     | rate             | ssid/vendor              | reason           |")
+        print("[scan_result] +----+-----+----------+----------+----------+----------+--------+---------+--------------------------+------------------+--------------------------+------------------+")
+        for frame in scan_result.frames:
+            fcs_text = "PASS" if frame.fcs_ok else "FAIL"
+            print(
+                "[scan_result] | "
+                f"{frame.frame_id:2d} | "
+                f"{fcs_text:4s} | "
+                f"{frame.peak_indices[0]:8d} | "
+                f"{frame.peak_indices[1]:8d} | "
+                f"{frame.peak_values[0]:8.1f} | "
+                f"{frame.peak_values[1]:8.1f} | "
+                f"{_fmt_scan_float(getattr(frame, 'snr_db', None), 6, 1)} | "
+                f"{_fmt_scan_float(getattr(frame, 'lts_snr_db', None), 7, 1)} | "
+                f"{_fmt_scan_cell(frame.frame_type_str, 24):24s} | "
+                f"{_fmt_scan_cell(getattr(frame, 'signal_rate_str', None), 16):16s} | "
+                f"{_fmt_scan_cell(_frame_identity_text(frame), 24):24s} | "
+                f"{_fmt_scan_cell(getattr(frame, 'decode_drop_reason', None), 16):16s} |"
+            )
+        print("[scan_result] +----+-----+----------+----------+----------+----------+--------+---------+--------------------------+------------------+--------------------------+------------------+")
+        print("[scan_result] expected lengths:")
+        for frame in scan_result.frames:
+            print(
+                f"[scan_result]   frame {frame.frame_id:2d}: "
+                f"{frame.expected_length_str}"
+            )
 
-    print("[scan_result] +----+-----+----------+----------+----------+----------+--------+---------+--------------------------+------------------+--------------------------+------------------+")
-    print("[scan_result] | id | fcs | peak1    | peak2    | p1_mag   | p2_mag   | snr_db | lts_snr | type                     | rate             | ssid/vendor              | reason           |")
-    print("[scan_result] +----+-----+----------+----------+----------+----------+--------+---------+--------------------------+------------------+--------------------------+------------------+")
-    for frame in scan_result.frames:
-        fcs_text = "PASS" if frame.fcs_ok else "FAIL"
-        print(
-            "[scan_result] | "
-            f"{frame.frame_id:2d} | "
-            f"{fcs_text:4s} | "
-            f"{frame.peak_indices[0]:8d} | "
-            f"{frame.peak_indices[1]:8d} | "
-            f"{frame.peak_values[0]:8.1f} | "
-            f"{frame.peak_values[1]:8.1f} | "
-            f"{_fmt_scan_float(getattr(frame, 'snr_db', None), 6, 1)} | "
-            f"{_fmt_scan_float(getattr(frame, 'lts_snr_db', None), 7, 1)} | "
-            f"{_fmt_scan_cell(frame.frame_type_str, 24):24s} | "
-            f"{_fmt_scan_cell(getattr(frame, 'signal_rate_str', None), 16):16s} | "
-            f"{_fmt_scan_cell(_frame_identity_text(frame), 24):24s} | "
-            f"{_fmt_scan_cell(getattr(frame, 'decode_drop_reason', None), 16):16s} |"
-        )
-    print("[scan_result] +----+-----+----------+----------+----------+----------+--------+---------+--------------------------+------------------+--------------------------+------------------+")
-    print("[scan_result] expected lengths:")
-    for frame in scan_result.frames:
-        print(
-            f"[scan_result]   frame {frame.frame_id:2d}: "
-            f"{frame.expected_length_str}"
-        )
+    _print_wifi_scan_evidence(scan_result)
 
+
+def _print_wifi_scan_evidence(scan_result):
     _, evidences, _ = classify_wifi(scan_result)
-    if evidences:
-        print("[scan_result] evidence:")
-        print("[scan_result] +----+-----+--------+----------+----------+----------+------------------+")
-        print("[scan_result] | id | fcs | signal | fc_valid | peak_gap | lts_pair | reason           |")
-        print("[scan_result] +----+-----+--------+----------+----------+----------+------------------+")
+    print("[scan_result] evidence:")
+    print("[scan_result] +----+-----+--------+----------+----------+----------+------------------+")
+    print("[scan_result] | id | fcs | signal | fc_valid | peak_gap | lts_pair | reason           |")
+    print("[scan_result] +----+-----+--------+----------+----------+----------+------------------+")
+    if not evidences:
+        print("[scan_result] | -- | --  | --     | --       | --       | --       | no_evidence      |")
+    else:
         for ev in evidences:
             print(
                 "[scan_result] | "
@@ -1409,21 +1690,132 @@ def _print_wifi_scan_summary(scan_result):
                 f"{str(ev.lts_pair_ok):8s} | "
                 f"{_fmt_scan_cell(ev.drop_reason, 16):16s} |"
             )
-        print("[scan_result] +----+-----+--------+----------+----------+----------+------------------+")
+    print("[scan_result] +----+-----+--------+----------+----------+----------+------------------+")
 
 
-def main(top_block_cls=wifi_rx_file, options=None):
-    file_t0_ns = time.perf_counter_ns()
-    setup_start_ns = file_t0_ns
-    if options is None:
-        options = argument_parser().parse_args()
+def _merge_frame_stats(dest: FrameStats, src: FrameStats):
+    dest.total_frames += src.total_frames
+    dest.passed_frames += src.passed_frames
+    dest.failed_frames += src.failed_frames
+    for key, value in src.frame_types.items():
+        dest.frame_types[key] += value
+    for key, value in src.error_types.items():
+        dest.error_types[key] += value
+    dest.ssids_found.update(src.ssids_found)
+    dest.macs_found.update(src.macs_found)
+    dest.bssids_found.update(src.bssids_found)
 
-    verbose = not options.compact
+
+def _run_pre_file_init(options, sync_long_cfg=None, prewarm_sample_count: Optional[int] = None):
+    rows = []
+
+    t0 = time.perf_counter_ns()
     if options.gr_perf:
         # Must be set before blocks are instantiated.
         prefs = gr.prefs().singleton()
         prefs.set_bool("PerfCounters", "on", True)
         prefs.set_bool("PerfCounters", "export", False)
+    rows.append({
+        "name": "gr_perf_init",
+        "ns": time.perf_counter_ns() - t0,
+        "extra": "enabled" if options.gr_perf else "skipped",
+    })
+
+    t0 = time.perf_counter_ns()
+    load_wireshark_manuf()
+    rows.append({
+        "name": "load_wireshark_manuf",
+        "ns": time.perf_counter_ns() - t0,
+        "extra": "cached",
+    })
+
+    t0 = time.perf_counter_ns()
+    if sync_long_cfg is not None and prewarm_sample_count is not None and prewarm_sample_count > 0:
+        prewarm_plan = _build_sync_long_chunk_plan(prewarm_sample_count, sync_long_cfg, options)
+        warmup_info = _warm_sync_long_cfo_banks(sync_long_cfg, prewarm_plan, prewarm_sample_count)
+        note = f"n={warmup_info['count']}" if warmup_info["count"] else "skipped"
+    else:
+        warmup_info = {"count": 0}
+        note = "unavailable"
+    rows.append({
+        "name": "warm_cfo_banks",
+        "ns": time.perf_counter_ns() - t0,
+        "extra": note,
+    })
+
+    return rows
+
+
+def _print_pre_file_init_timing(rows):
+    if not rows:
+        return
+    total_ns = sum(int(row.get("ns", 0)) for row in rows)
+    print("\n[timing] Pre-File Init Excluded From Runtime")
+    print("[timing] +----------------------+------------+----------+------------------+")
+    print("[timing] | step                 |    ms      |   pct    | note             |")
+    print("[timing] +----------------------+------------+----------+------------------+")
+    for row in rows:
+        ns = int(row.get("ns", 0))
+        ms = ns / 1e6
+        pct = (100.0 * ns / total_ns) if total_ns else 0.0
+        note = str(row.get("extra", "") or "")
+        if len(note) > 16:
+            note = note[:13] + "..."
+        print(f"[timing] | {row['name']:<20} | {ms:10.3f} | {pct:7.2f}% | {note:<16} |")
+    print("[timing] +----------------------+------------+----------+------------------+")
+    print(f"[timing] | {'pre_file_init_total':<20} | {total_ns / 1e6:10.3f} | {100.00:7.2f}% | {'excluded':<16} |")
+    print("[timing] +----------------------+------------+----------+------------------+")
+
+
+def _warm_sync_long_cfo_banks(cfg: SyncLongConfig, chunk_plan, total_samples: int):
+    if not cfg.with_freqoffset_search or total_samples <= 0:
+        return {"ns": 0, "count": 0, "lengths": []}
+
+    training_seq = np.asarray(
+        cfg.long_training if cfg.long_training is not None else get_long_training_sequence("cc"),
+        dtype=np.complex64,
+    )
+    unique_lengths = sorted({max(0, int(chunk_end - chunk_start)) for chunk_start, chunk_end in chunk_plan if chunk_end > chunk_start})
+    if not unique_lengths:
+        return {"ns": 0, "count": 0, "lengths": []}
+
+    t0 = time.perf_counter_ns()
+    for fft_len in unique_lengths:
+        freq_search = get_freq_search_rng(
+            fft_len,
+            len(training_seq),
+            cfg.cfo_start_idx,
+            cfg.cfo_end_idx,
+            sync_seq_rate=cfg.samp_rate,
+        )
+        get_or_build_cfo_filter_bank(training_seq, fft_len, freq_search)
+    return {
+        "ns": time.perf_counter_ns() - t0,
+        "count": len(unique_lengths),
+        "lengths": unique_lengths,
+    }
+
+
+def main(top_block_cls=wifi_rx_file, options=None):
+    if options is None:
+        options = argument_parser().parse_args()
+
+    sync_long_cfg = _build_sync_long_cfg(options) if options.sync_long_only else None
+    prewarm_sample_count = (
+        _probe_input_sample_count(options.input_file, getattr(options, "samp_rate_in", None))
+        if options.sync_long_only else None
+    )
+    process_t0_ns = time.perf_counter_ns()
+    pre_file_init_rows = _run_pre_file_init(
+        options,
+        sync_long_cfg=sync_long_cfg,
+        prewarm_sample_count=prewarm_sample_count,
+    )
+    pre_file_init_done_ns = time.perf_counter_ns()
+    file_t0_ns = pre_file_init_done_ns
+    setup_start_ns = file_t0_ns
+
+    verbose = not options.compact
 
     print("=" * 80)
     print("gr-ieee802-11 WiFi Receiver v14 - Constellation Detection")
@@ -1444,6 +1836,13 @@ def main(top_block_cls=wifi_rx_file, options=None):
     detection = None
     scan_result = None
     temp_input_path = None
+    prep_result = None
+    prep_rows = []
+    final_packet_count = 0
+    final_stats = None
+    final_stage_time_ns = defaultdict(int)
+    final_total_msg_time_ns = 0
+    final_resolver = None
 
     input_path = options.input_file
     if input_path.lower().endswith(".mat") and not options.sync_long_only:
@@ -1452,13 +1851,43 @@ def main(top_block_cls=wifi_rx_file, options=None):
         temp_input_path = _mat_to_tmp_cfile(input_path, samp_rate_in=samp_rate_in)
         print(f"[mat] Temp file: {temp_input_path}")
         input_path = temp_input_path
+    if input_path.lower().endswith(".iq") and not options.sync_long_only:
+        samp_rate_in = float(options.samp_rate_in) if options.samp_rate_in else 40e6
+        print(f"[iq] Converting .iq -> temp .cfile (resample {samp_rate_in / 1e6:.2f} -> 20.00 MHz)...")
+        temp_input_path = _iq_to_tmp_cfile(input_path, samp_rate_in=samp_rate_in)
+        print(f"[iq] Temp file: {temp_input_path}")
+        input_path = temp_input_path
 
     if options.sync_long_only:
-        capture, detection = _prepare_python_sync_long_capture(options)
+        cfg, iq_data, input_path = _load_sync_long_iq_data(options, prep_rows)
+        print(f"[sync_long_only] Loaded {len(iq_data):,} IQ samples from {input_path}")
+        chunk_plan = _build_sync_long_chunk_plan(len(iq_data), cfg, options)
+        if options.sync_long_chunk_samples:
+            print(
+                "[sync_long_only] "
+                f"chunked front-to-back search enabled: chunk_samples={int(options.sync_long_chunk_samples):,}, "
+                f"chunks={len(chunk_plan)}"
+            )
+        elif options.sync_long_two_pass_halves:
+            print(f"[sync_long_only] two-pass half search enabled: chunks={len(chunk_plan)}")
+        prep_result = _prepare_python_sync_long_capture_for_chunk(
+            options,
+            cfg,
+            iq_data,
+            chunk_plan[0][0],
+            chunk_plan[0][1],
+            prep_rows,
+            1,
+            len(chunk_plan),
+        )
+        capture = prep_result.capture
+        detection = prep_result.detection
         tb = wifi_rx_sync_long_only(
             capture=capture,
             output_pcap=options.output_pcap,
             verbose=verbose,
+            stop_after_first_good=bool(options.stop_after_first_good),
+            use_throttle=not options.sync_long_no_throttle,
         )
     else:
         tb = top_block_cls(
@@ -1475,31 +1904,42 @@ def main(top_block_cls=wifi_rx_file, options=None):
 
     def print_final_timing():
         report_start_ns = time.perf_counter_ns()
-        tb.msg_handler.stats.print_summary()
+        stats_ref = final_stats if final_stats is not None else tb.msg_handler.stats
+        stage_time_ref = final_stage_time_ns if final_stats is not None else tb.msg_handler.stage_time_ns
+        total_msg_time_ref = final_total_msg_time_ns if final_stats is not None else tb.msg_handler.total_msg_time_ns
+
+        stats_ref.print_summary()
         stats_done_ns = time.perf_counter_ns()
         tb.pcap.close()
         close_done_ns = time.perf_counter_ns()
 
+        process_total_ns = close_done_ns - process_t0_ns
+        pre_file_init_ns = pre_file_init_done_ns - process_t0_ns
+        excluded_runtime_ns = pre_file_init_ns
         file_total_ns = close_done_ns - file_t0_ns
         setup_ns = setup_done_ns - setup_start_ns
         run_ns = max(0, run_end_ns - run_start_ns)
         report_ns = stats_done_ns - report_start_ns
         close_ns = close_done_ns - stats_done_ns
 
-        python_handler_ns = tb.msg_handler.total_msg_time_ns
+        python_handler_ns = total_msg_time_ref
         python_non_handler_ns = max(0, report_ns + close_ns)
         non_python_ns = max(0, file_total_ns - python_handler_ns - python_non_handler_ns)
-        run_non_handler_ns = max(0, run_ns - python_handler_ns)
+        replay_non_python_ns = max(0, run_ns - python_handler_ns)
         non_python_setup_ns = max(0, setup_ns)
         non_python_run_residual_ns = max(0, run_ns - python_handler_ns)
         non_python_unattributed_ns = max(
             0, non_python_ns - non_python_setup_ns - non_python_run_residual_ns
         )
+        prep_total_ns = sum(int(row.get("ns", 0)) for row in prep_rows)
+        prep_load_iq_ns = sum(int(row.get("ns", 0)) for row in prep_rows if str(row.get("name", "")).startswith("load_iq"))
+        prep_sync_long_ns = max(0, prep_total_ns - prep_load_iq_ns)
+        tb_build_ns = max(0, setup_ns - prep_total_ns)
 
         # Export totals for C++ atexit timing summary (% of file total).
         os.environ["WIFI_FILE_TOTAL_NS"] = str(file_total_ns)
         os.environ["WIFI_PY_HANDLER_NS"] = str(python_handler_ns)
-        os.environ["WIFI_RUN_NON_HANDLER_NS"] = str(run_non_handler_ns)
+        os.environ["WIFI_RUN_NON_HANDLER_NS"] = str(replay_non_python_ns)
         if options.gr_perf:
             _export_stage_weights_env(tb)
 
@@ -1507,26 +1947,33 @@ def main(top_block_cls=wifi_rx_file, options=None):
             return (100.0 * ns / file_total_ns) if file_total_ns else 0.0
 
         print(f"[timing] file_total_ms={file_total_ns / 1e6:.3f}")
+        print(f"[timing] process_total_ms={process_total_ns / 1e6:.3f}")
+        print(f"[timing] pre_file_init_excluded_ms={excluded_runtime_ns / 1e6:.3f}")
         print(f"[timing] python_total_ms={(python_handler_ns + python_non_handler_ns) / 1e6:.3f}")
         print(f"[timing] python_handler_ms={python_handler_ns / 1e6:.3f}")
         print(f"[timing] python_non_handler_ms={python_non_handler_ns / 1e6:.3f}")
         print(f"[timing] non_python_ms={non_python_ns / 1e6:.3f}")
-        print(f"[timing] non_python_setup_ms={non_python_setup_ns / 1e6:.3f} ({pct(non_python_setup_ns):.2f}%)")
-        print(f"[timing] non_python_run_residual_ms={non_python_run_residual_ns / 1e6:.3f} ({pct(non_python_run_residual_ns):.2f}%)")
+        print(f"[timing] pre_run_prep_ms={non_python_setup_ns / 1e6:.3f} ({pct(non_python_setup_ns):.2f}%)")
+        print(f"[timing] replay_non_python_ms={non_python_run_residual_ns / 1e6:.3f} ({pct(non_python_run_residual_ns):.2f}%)")
         print(f"[timing] non_python_unattributed_ms={non_python_unattributed_ns / 1e6:.3f} ({pct(non_python_unattributed_ns):.2f}%)")
         print(f"[timing] phase_setup_ms={setup_ns / 1e6:.3f}")
         print(f"[timing] phase_run_ms={run_ns / 1e6:.3f}")
         print(f"[timing] phase_report_ms={report_ns / 1e6:.3f}")
         print(f"[timing] phase_close_ms={close_ns / 1e6:.3f}")
-        print("[timing] note: cpp_total/cpp_block lines are printed at process exit and belong mostly to non_python_run_residual_ms")
+        print(f"[timing] setup_breakdown_ms: load_iq={prep_load_iq_ns / 1e6:.3f}  sync_long_prep={prep_sync_long_ns / 1e6:.3f}  tb_build={tb_build_ns / 1e6:.3f}")
+        print("[timing] note: setup/pre_run_prep = work before tb.run() starts")
+        print("[timing] note: replay_non_python = GNU Radio/C++ runtime inside tb.run(), excluding Python message handling")
+        print("[timing] note: cpp_total/cpp_block lines printed at process exit are a subset of replay_non_python_ms")
+        _print_pre_file_init_timing(pre_file_init_rows)
+        if prep_result is not None:
+            _print_sync_long_prep_timing(prep_rows)
 
         # Additive breakdown: sums exactly (up to rounding) to file_total.
         additive_rows = [
-            ("setup", setup_ns),
+            ("startup_and_prep", setup_ns),
             ("python_handler", python_handler_ns),
-            ("run_non_handler", run_non_handler_ns),
-            ("report", report_ns),
-            ("close", close_ns),
+            ("cpp_functions", replay_non_python_ns),
+            ("python_support", report_ns + close_ns),
         ]
         print("\n[timing] Additive Runtime Breakdown (sums to total)")
         print("[timing] +-------------------+------------+----------+")
@@ -1543,34 +1990,12 @@ def main(top_block_cls=wifi_rx_file, options=None):
         print(f"[timing] | {'SUM':<17} | {sum_ms:10.3f} | {sum_pct:7.2f}% |")
         print("[timing] +-------------------+------------+----------+")
 
-        # Top Python stage functions within handler path.
-        if tb.msg_handler.stage_time_ns:
-            print("\n[timing] Top Python Handler Functions")
-            print("[timing] +-------------------+------------+----------+----------+")
-            print("[timing] | function          |    ms      | %handler |  %total  |")
-            print("[timing] +-------------------+------------+----------+----------+")
-            sorted_stages = sorted(tb.msg_handler.stage_time_ns.items(),
-                                   key=lambda kv: kv[1],
-                                   reverse=True)
-            stage_sum_ns = 0
-            for stage, t_ns in sorted_stages:
-                stage_sum_ns += t_ns
-                ms = t_ns / 1e6
-                pct_handler = (100.0 * t_ns / python_handler_ns) if python_handler_ns else 0.0
-                pct_total = (100.0 * t_ns / file_total_ns) if file_total_ns else 0.0
-                print(f"[timing] | {stage:<17} | {ms:10.3f} | {pct_handler:7.2f}% | {pct_total:7.2f}% |")
-            stage_sum_ms = stage_sum_ns / 1e6
-            stage_sum_pct = (100.0 * stage_sum_ns / file_total_ns) if file_total_ns else 0.0
-            print("[timing] +-------------------+------------+----------+----------+")
-            print(f"[timing] | {'handler_stage_sum':<17} | {stage_sum_ms:10.3f} | {100.00:7.2f}% | {stage_sum_pct:7.2f}% |")
-            print("[timing] +-------------------+------------+----------+----------+")
-
         if options.gr_perf:
             _print_gr_stage_perf_tables(
                 tb,
                 file_total_ns=file_total_ns,
                 run_ns=run_ns,
-                run_non_handler_ns=run_non_handler_ns,
+                run_non_handler_ns=replay_non_python_ns,
             )
 
     def sig_handler(sig=None, frame=None):
@@ -1588,11 +2013,52 @@ def main(top_block_cls=wifi_rx_file, options=None):
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
 
-    print("Processing file until EOF (Ctrl-C to stop)...\n")
+    if options.sync_long_only and options.stop_after_first_good:
+        print("Processing file until first good FCS or EOF (Ctrl-C to stop)...\n")
+    else:
+        print("Processing file until EOF (Ctrl-C to stop)...\n")
 
     try:
         run_start_ns = time.perf_counter_ns()
-        tb.run()  # IMPORTANT: run to EOF
+        if options.sync_long_only:
+            chunk_plan = _build_sync_long_chunk_plan(len(iq_data), cfg, options)
+            final_stats = FrameStats()
+            for chunk_idx, (chunk_start, chunk_end) in enumerate(chunk_plan, start=1):
+                if chunk_idx > 1:
+                    prep_result = _prepare_python_sync_long_capture_for_chunk(
+                        options,
+                        cfg,
+                        iq_data,
+                        chunk_start,
+                        chunk_end,
+                        prep_rows,
+                        chunk_idx,
+                        len(chunk_plan),
+                    )
+                    capture = prep_result.capture
+                    detection = prep_result.detection
+                    tb.load_capture(capture)
+                tb.run()
+                final_packet_count = tb.msg_handler.packet_count
+                final_stats = tb.msg_handler.stats
+                final_total_msg_time_ns = tb.msg_handler.total_msg_time_ns
+                final_resolver = tb.msg_handler.resolver
+                final_stage_time_ns = tb.msg_handler.stage_time_ns
+
+                if tb.msg_handler.good_fcs_count > 0:
+                    print(
+                        "[sync_long_only] "
+                        f"chunk {chunk_idx}/{len(chunk_plan)} produced a good FCS; stopping staged search."
+                    )
+                    break
+
+                if chunk_idx < len(chunk_plan):
+                    print(
+                        "[sync_long_only] "
+                        f"chunk {chunk_idx}/{len(chunk_plan)} had no good FCS; preparing chunk {chunk_idx + 1}/{len(chunk_plan)}."
+                    )
+        else:
+            tb.run()  # IMPORTANT: run to EOF
         run_end_ns = time.perf_counter_ns()
     except KeyboardInterrupt:
         run_end_ns = time.perf_counter_ns()
@@ -1603,7 +2069,7 @@ def main(top_block_cls=wifi_rx_file, options=None):
             capture=capture,
             corr_long=detection["corr_long"],
             decoded_frames=tb.msg_handler.decoded_frames,
-            resolver=tb.msg_handler.resolver,
+            resolver=final_resolver or tb.msg_handler.resolver,
             lts_snr_db_list=capture.get("lts_snr_db"),
         )
         tb.scan_result = scan_result
@@ -1614,7 +2080,7 @@ def main(top_block_cls=wifi_rx_file, options=None):
     print()
     print("=" * 80)
     print("✓ Processing complete!")
-    print(f"✓ Handler saw {tb.msg_handler.packet_count} PDUs (good+bad if published)")
+    print(f"✓ Handler saw {final_packet_count if final_stats is not None else tb.msg_handler.packet_count} PDUs (good+bad if published)")
     print(f"✓ Written Radiotap PCAP to: {options.output_pcap}")
     print("=" * 80)
 
