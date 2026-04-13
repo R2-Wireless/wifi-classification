@@ -76,8 +76,8 @@ class SyncLongConfig:
     samp_rate: float = 20e6
     expected_gap: int = 64
     with_freqoffset_search: bool = True
-    cfo_start_idx: int = -200
-    cfo_end_idx: int = 200
+    cfo_start_idx: int = -100
+    cfo_end_idx: int = 100
     threshold_scale: float = 0.7
     rms_stride: int = 30
     max_copy: int = 540 * 80
@@ -186,7 +186,7 @@ def get_freq_search_rng(
     freq_start_steps: int,
     freq_end_steps: int,
     sync_seq_rate: float = 20e6,
-    resolution_parameter: float = 4.0,
+    resolution_parameter: float = 2.0,
 ) -> Dict[str, np.ndarray]:
     sync_duration_sec = sync_seq_len / sync_seq_rate
     bin_width_hz = 0.5*sync_seq_rate / data_len

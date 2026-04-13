@@ -34,3 +34,8 @@ ttt_long_only.log
 ttt_long_only_second_fail.log
 ttt_long_only_second_pass.log
 ttt_long_Skydio
+ttt_cfile_10M.log
+ttt_long_rate.log
+ttt_sinc_long.log
+ttt_sync_long_only.py
+ttt_long_only.py

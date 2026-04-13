@@ -211,6 +211,33 @@
       },
       "console": "integratedTerminal",
       "justMyCode": false
+    },
+    {
+      "name": "Python (debugpy): run_main_17.py direct replay 10 MHz",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_main_17.py",
+      "args": [
+        "/mnt/c/Users/Public/Documents/Wify/records_files/DoodleLab-tx10MHz-Denmark/DoodleLab-2400MHz-06-18-25-15h41m30s589.iq",
+        "--channel-bw",
+        "10",
+        "--cfo-range",
+        "5e6",
+        "--num-cfo-steps",
+        "201",
+        "--fine-cfo-mode",
+        "apply",
+        "--replay-direct",
+        "--output-pcap",
+        "/tmp/replay_output.pcap"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONPATH": "${workspaceFolder}/external/python:${workspaceFolder}/external/build/python/bindings:${workspaceFolder}/external/build/python:${env:PYTHONPATH}",
+        "LD_LIBRARY_PATH": "${workspaceFolder}/external/build/lib:${env:LD_LIBRARY_PATH}"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
     }
   ]
 }

@@ -30,6 +30,10 @@ void ensure_registered()
     if (!g_registered) {
         std::atexit([]() {
             std::lock_guard<std::mutex> lock(g_mutex);
+            const char* disable_env = std::getenv("WIFI_FRAME_TRACE_DISABLE");
+            if (disable_env && *disable_env && std::string(disable_env) != "0") {
+                return;
+            }
             if (g_rows.empty()) {
                 return;
             }
