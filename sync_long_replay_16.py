@@ -26,7 +26,12 @@ Usage:
 
 import sys
 import os
+import re
+import struct
 import tempfile
+import time
+from collections import defaultdict
+
 import numpy as np
 import pmt
 
@@ -38,38 +43,350 @@ import ieee802_11
 sys.path.insert(0, os.path.dirname(__file__))
 from sync_long_capture_probe import load_sync_long_capture
 
-# Reuse the message handler and PCAPWriter from the main script
-# Adjust the import path if main_script_14.py is in a different location.
-try:
-    try:
-        from run_main_16 import message_handler, PCAPWriter
-    except ImportError:
-        from main_script_14 import message_handler, PCAPWriter
-except ImportError:
-    # Minimal stub if the main script is not importable
-    class PCAPWriter:
-        def __init__(self, path):
-            print(f"[replay] PCAPWriter stub — output to {path}")
-            self.packet_count = 0
-        def write_packet(self, *a, **kw): pass
-        def close(self): pass
+_WIRESHARK_MANUF_CACHE = None
 
-    class message_handler(gr.sync_block):
-        def __init__(self, pcap, center_freq_hz=5.18e9, samp_rate_hz=20e6, verbose=True):
-            gr.sync_block.__init__(self, "message_handler", in_sig=None, out_sig=None)
-            self.pcap = pcap
-            self.packet_count = 0
-            self.total_msg_time_ns = 0
-            self.stats = type("S", (), {"print_summary": lambda s: None,
-                                        "total_frames": 0})()
-            self.message_port_register_in(pmt.intern("in"))
-            self.set_msg_handler(pmt.intern("in"), self._handle)
-        def _handle(self, msg):
-            self.packet_count += 1
+
+def load_wireshark_manuf(path="/usr/share/wireshark/manuf"):
+    global _WIRESHARK_MANUF_CACHE
+    if _WIRESHARK_MANUF_CACHE is not None:
+        return _WIRESHARK_MANUF_CACHE
+    mapping = {}
+    try:
+        with open(path, "r", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                prefix = parts[0].lower()
+                if "/" in prefix:
+                    continue
+                if re.fullmatch(r"[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}", prefix):
+                    mapping[prefix] = " ".join(parts[1:])
+    except FileNotFoundError:
+        pass
+    _WIRESHARK_MANUF_CACHE = mapping
+    return mapping
+
+
+class MacResolver:
+    def __init__(self):
+        self.oui_map = load_wireshark_manuf()
+
+    def vendor_of(self, mac: str):
+        if not mac or mac == "00:00:00:00:00:00":
+            return None
+        oui = ":".join(mac.split(":")[:3]).lower()
+        return self.oui_map.get(oui)
+
+
+TYPE_NAMES = {0: "Management", 1: "Control", 2: "Data", 3: "Reserved"}
+DECODE_FRAME_TYPE = {0: True, 1: True, 2: True, 3: True}
+MGMT_SUBTYPE_NAMES = {
+    0: "Association Request", 1: "Association Response", 2: "Reassociation Request",
+    3: "Reassociation Response", 4: "Probe Request", 5: "Probe Response",
+    8: "Beacon", 9: "ATIM", 10: "Disassociation", 11: "Authentication",
+    12: "Deauthentication", 13: "Action", 14: "Action No Ack",
+}
+CTRL_SUBTYPE_NAMES = {
+    7: "Control Wrapper", 8: "Block Ack Request", 9: "Block Ack",
+    10: "PS-Poll", 11: "RTS", 12: "CTS", 13: "ACK",
+    14: "CF-End", 15: "CF-End + CF-Ack",
+}
+DATA_SUBTYPE_NAMES = {0: "Data", 4: "Null", 8: "QoS Data", 12: "QoS Null"}
+
+
+def _fmt_mac(b: bytes) -> str:
+    return ":".join(f"{x:02x}" for x in b)
+
+
+def parse_frame_control(fc: int) -> dict:
+    version = fc & 0x3
+    ftype = (fc >> 2) & 0x3
+    subtype = (fc >> 4) & 0xF
+    flags = {
+        "to_ds": bool((fc >> 8) & 1),
+        "from_ds": bool((fc >> 9) & 1),
+    }
+    if not flags["to_ds"] and not flags["from_ds"]:
+        ds_dir = "IBSS/ad-hoc"
+    elif flags["to_ds"] and not flags["from_ds"]:
+        ds_dir = "To DS"
+    elif not flags["to_ds"] and flags["from_ds"]:
+        ds_dir = "From DS"
+    else:
+        ds_dir = "WDS"
+
+    if ftype == 0:
+        subtype_name = MGMT_SUBTYPE_NAMES.get(subtype, f"Mgmt-{subtype}")
+    elif ftype == 1:
+        subtype_name = CTRL_SUBTYPE_NAMES.get(subtype, f"Ctrl-{subtype}")
+    elif ftype == 2:
+        subtype_name = DATA_SUBTYPE_NAMES.get(subtype, f"Data-{subtype}")
+    else:
+        subtype_name = f"Subtype-{subtype}"
+
+    return {
+        "version": version,
+        "type": ftype,
+        "subtype": subtype,
+        "type_name": TYPE_NAMES.get(ftype, "Unknown"),
+        "subtype_name": subtype_name,
+        "flags": flags,
+        "ds_direction": ds_dir,
+    }
+
+
+def _is_qos_data_subtype(subtype: int) -> bool:
+    return subtype in (8, 12)
+
+
+def derive_address_roles(data: bytes, fc_info: dict):
+    if len(data) < 10:
+        return {}
+
+    ftype = fc_info["type"]
+    subtype = fc_info["subtype"]
+    to_ds = fc_info["flags"]["to_ds"]
+    from_ds = fc_info["flags"]["from_ds"]
+    roles = {}
+
+    def mac_at(off: int):
+        if off + 6 <= len(data):
+            return _fmt_mac(data[off:off + 6])
+        return None
+
+    addr1 = mac_at(4)
+    addr2 = mac_at(10)
+    addr3 = mac_at(16)
+    if addr1:
+        roles["addr1"] = addr1
+    if addr2:
+        roles["addr2"] = addr2
+    if addr3:
+        roles["addr3"] = addr3
+
+    if ftype == 0:
+        if addr1:
+            roles["ra_da"] = addr1
+        if addr2:
+            roles["ta_sa"] = addr2
+        if addr3:
+            roles["bssid"] = addr3
+        return roles
+
+    if ftype == 1:
+        if addr1:
+            roles["ra"] = addr1
+        if subtype in (11, 8, 9) and addr2:
+            roles["ta"] = addr2
+        return roles
+
+    if ftype == 2:
+        has_addr4 = to_ds and from_ds
+        addr4 = mac_at(24 + (2 if _is_qos_data_subtype(subtype) else 0)) if has_addr4 else None
+        if addr4:
+            roles["addr4"] = addr4
+        if not to_ds and not from_ds:
+            if addr1:
+                roles["da"] = addr1
+            if addr2:
+                roles["sa"] = addr2
+            if addr3:
+                roles["bssid"] = addr3
+        elif to_ds and not from_ds:
+            if addr1:
+                roles["bssid"] = addr1
+            if addr2:
+                roles["sa"] = addr2
+            if addr3:
+                roles["da"] = addr3
+        elif not to_ds and from_ds:
+            if addr1:
+                roles["da"] = addr1
+            if addr2:
+                roles["bssid"] = addr2
+            if addr3:
+                roles["sa"] = addr3
+        else:
+            if addr1:
+                roles["ra"] = addr1
+            if addr2:
+                roles["ta"] = addr2
+            if addr3:
+                roles["da"] = addr3
+            if addr4:
+                roles["sa"] = addr4
+    return roles
+
+
+def parse_ies(ies: bytes):
+    i = 0
+    out = {"ssid": None}
+    while i + 2 <= len(ies):
+        eid = ies[i]
+        elen = ies[i + 1]
+        i += 2
+        if i + elen > len(ies):
+            break
+        body = ies[i:i + elen]
+        i += elen
+        if eid == 0:
+            out["ssid"] = body.decode("utf-8", errors="replace")
+    return out
+
+
+class PCAPWriter:
+    DLT_IEEE802_11_RADIOTAP = 127
+
+    def __init__(self, filename):
+        self.f = open(filename, "wb")
+        self.f.write(struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, self.DLT_IEEE802_11_RADIOTAP))
+        self.packet_count = 0
+
+    def _radiotap_header(self, center_freq_hz: float | None) -> bytes:
+        chan_freq_mhz = int(round(center_freq_hz / 1e6)) if center_freq_hz else 0
+        chan_flags = 0x0100 | 0x0040 if center_freq_hz and center_freq_hz >= 4e9 else 0x0080 | 0x0040
+        present = (1 << 1) | (1 << 2)
+        fields = struct.pack("<B", 0) + b"\x00" + struct.pack("<HH", chan_freq_mhz & 0xFFFF, chan_flags & 0xFFFF)
+        rt_len = 8 + len(fields)
+        return struct.pack("<BBHI", 0, 0, rt_len, present) + fields
+
+    def write_packet(self, mac_frame_bytes: bytes, timestamp: float | None = None, center_freq_hz: float | None = None, **_kwargs):
+        if timestamp is None:
+            timestamp = time.time()
+        ts_sec = int(timestamp)
+        ts_usec = int((timestamp - ts_sec) * 1_000_000)
+        pkt = self._radiotap_header(center_freq_hz) + mac_frame_bytes
+        self.f.write(struct.pack("<IIII", ts_sec, ts_usec, len(pkt), len(pkt)))
+        self.f.write(pkt)
+        self.f.flush()
+        self.packet_count += 1
+
+    def close(self):
+        self.f.close()
+
+
+class FrameStats:
+    def __init__(self):
+        self.total_frames = 0
+        self.passed_frames = 0
+        self.failed_frames = 0
+
+    def add_success(self):
+        self.total_frames += 1
+        self.passed_frames += 1
+
+    def add_failure(self, _reason: str = "Unknown"):
+        self.total_frames += 1
+        self.failed_frames += 1
+
+    def print_summary(self):
+        print(
+            f"[replay] Summary: total={self.total_frames} "
+            f"passed={self.passed_frames} failed={self.failed_frames}"
+        )
+
+
+class message_handler(gr.sync_block):
+    def __init__(self, pcap, center_freq_hz=5.18e9, samp_rate_hz=20e6, verbose=True):
+        gr.sync_block.__init__(self, "message_handler", in_sig=None, out_sig=None)
+        self.pcap = pcap
+        self.center_freq_hz = float(center_freq_hz)
+        self.samp_rate_hz = float(samp_rate_hz)
+        self.verbose = bool(verbose)
+        self.packet_count = 0
+        self.total_msg_time_ns = 0
+        self.stats = FrameStats()
+        self.resolver = MacResolver()
+        self.decoded_frames = []
+        self.stage_time_ns = defaultdict(int)
+        self.stage_count = defaultdict(int)
+        self.message_port_register_in(pmt.intern("in"))
+        self.set_msg_handler(pmt.intern("in"), self.handle_msg)
+
+    @staticmethod
+    def _meta_get_bool(meta, key: str, default: bool = False) -> bool:
+        try:
+            return bool(pmt.to_bool(pmt.dict_ref(meta, pmt.intern(key), pmt.from_bool(default))))
+        except Exception:
+            return bool(default)
+
+    @staticmethod
+    def _meta_get_double(meta, key: str, default: float = 0.0) -> float:
+        try:
+            return float(pmt.to_double(pmt.dict_ref(meta, pmt.intern(key), pmt.from_double(default))))
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _meta_get_uint64(meta, key: str, default: int = 0) -> int:
+        try:
+            return int(pmt.to_uint64(pmt.dict_ref(meta, pmt.intern(key), pmt.from_uint64(default))))
+        except Exception:
+            return int(default)
+
+    def handle_msg(self, msg):
+        t_msg_start_ns = time.perf_counter_ns()
+        try:
             meta = pmt.car(msg)
-            fcs_ok = pmt.to_bool(pmt.dict_ref(meta, pmt.intern("fcs_ok"),
-                                              pmt.from_bool(False)))
-            print(f"[replay] PDU #{self.packet_count}  fcs_ok={fcs_ok}")
+            frame_bytes = pmt.cdr(msg)
+            if pmt.is_u8vector(frame_bytes):
+                data = bytes(pmt.u8vector_elements(frame_bytes))
+            elif pmt.is_blob(frame_bytes):
+                data = bytes(pmt.blob_data(frame_bytes))
+            else:
+                self.stats.add_failure("Invalid PMT type")
+                return
+
+            if len(data) < 2:
+                self.stats.add_failure("Frame too short")
+                return
+
+            fcs_ok = self._meta_get_bool(meta, "fcs_ok", False)
+            snr_db = self._meta_get_double(meta, "snr", 0.0)
+            fc = struct.unpack_from("<H", data, 0)[0]
+            fc_info = parse_frame_control(fc)
+            if not DECODE_FRAME_TYPE.get(fc_info["type"], False):
+                return
+
+            roles = derive_address_roles(data, fc_info)
+            ssid = None
+            if fc_info["type"] == 0 and fc_info["subtype"] in (4, 5, 8):
+                ie_off = 24 if fc_info["subtype"] == 4 else 36
+                if len(data) > ie_off:
+                    ssid = parse_ies(data[ie_off:]).get("ssid")
+
+            self.packet_count += 1
+            self.decoded_frames.append({
+                "frame_id": self._meta_get_uint64(meta, "frame_id", 0),
+                "fcs_ok": bool(fcs_ok),
+                "data": data,
+                "fc_info": fc_info,
+                "roles": roles,
+                "ssid": ssid,
+                "decode_drop_reason": None if fcs_ok else "fcs_fail",
+                "signal_encoding": self._meta_get_uint64(meta, "encoding", 0),
+                "signal_frame_bytes": self._meta_get_uint64(meta, "frame bytes", 0),
+                "snr_db": snr_db,
+            })
+
+            if fcs_ok:
+                self.stats.add_success()
+                self.pcap.write_packet(data, timestamp=time.time(), center_freq_hz=self.center_freq_hz)
+            else:
+                self.stats.add_failure("FCS")
+
+            if self.verbose:
+                print(
+                    f"[replay] PDU #{self.packet_count} "
+                    f"type={fc_info['type_name']}/{fc_info['subtype_name']} "
+                    f"fcs_ok={fcs_ok} bytes={len(data)} snr={snr_db:.1f}dB"
+                )
+        finally:
+            self.total_msg_time_ns += time.perf_counter_ns() - t_msg_start_ns
 
 
 _ENCODING_INFO = {

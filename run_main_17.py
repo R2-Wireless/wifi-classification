@@ -18,10 +18,10 @@ sync_long_capture_probe.py, or any other project module.
 
 Supported input formats
 -----------------------
-  .mat   — MATLAB file, one complex variable (input is resampled to 20 MHz)
-  .iq    — raw interleaved int16 IQ    (input is resampled to 20 MHz)
-  .bin   — raw interleaved int16 IQ    (input is resampled to 20 MHz)
-  .cfile — raw interleaved float32 IQ, GNURadio format at 20 MHz
+  .mat   — MATLAB file, one complex variable
+  .iq    — raw interleaved int16 IQ
+  .bin   — raw interleaved int16 IQ
+  .cfile — raw interleaved float32 IQ, GNURadio format
 
 Pipeline stages
 ---------------
@@ -49,24 +49,14 @@ Usage (CLI)
   python run_main_1.py capture.bin --channel-bw 10
   python run_main_1.py capture.mat --channel-bw 20
 
-Channel-bandwidth / input-rate mapping
-----------------------------------------
-  --channel-bw 5  → .bin/.mat hypothesis: 4×30.72 MHz = 122.88 MHz
-                    .iq hypothesis:        4×40 MHz   = 160 MHz
-  --channel-bw 10 → .bin/.mat hypothesis: 2×30.72 MHz = 61.44 MHz
-                    .iq hypothesis:        2×40 MHz   = 80 MHz
-  --channel-bw 20 → .bin/.mat hypothesis:   30.72 MHz
-                    .iq hypothesis:          40 MHz
-  (When --channel-bw is omitted the legacy multi-hypothesis auto-detect is used.)
-
 Usage (import)
 --------------
   from run_main_1 import init, load_file, resample, detect, capture, SyncLongConfig
 
-  cfg    = SyncLongConfig()                   # 20 MHz target
+  cfg    = SyncLongConfig()
   bank   = init(cfg)                         # pre-build filter bank (call once)
   raw, _ = load_file("capture.iq")           # load raw samples
-  iq     = resample(raw, ".iq")             # resample to 20 MHz
+  iq     = resample(raw, ".iq")
   det    = detect(iq, bank, cfg)             # sync_long detection
   cap    = capture(iq, det, cfg)             # build frame capture
   # cap["samples"], cap["tag_offsets"], ... etc.
@@ -96,9 +86,6 @@ _CFO_TILE_SIZE  = max(1, int(os.environ.get("SYNC_LONG_CFO_TILE", "4")))
 TARGET_SAMP_RATE: float = 20e6
 
 # Source sample rates by file extension (used when --samp-rate-in is not given).
-# For .iq, two hypotheses are tried automatically (80 MHz and 40 MHz);
-# the one that yields the most detected frames is kept.
-# For .bin, three hypotheses are tried: 30.72 MHz, 61.44 MHz, 122.88 MHz.
 SAMP_RATE_BY_EXT: Dict[str, float] = {
     ".mat":   30.72e6,
     ".iq":    40e6,
@@ -110,9 +97,6 @@ SAMP_RATE_BY_EXT: Dict[str, float] = {
 IQ_RATE_HYPOTHESES: List[float] = [40e6]
 
 # All input-rate hypotheses to try when the extension is .bin.
-# Ordered fastest-first (122.88 → 61.44 → 30.72 MHz): the highest input rate
-# produces the smallest resampled buffer and therefore the fastest FFT.
-# _detect_iq_dual_hypothesis will stop as soon as any hypothesis finds frames.
 BIN_RATE_HYPOTHESES: List[float] = [30.72e6]
 
 # ---------------------------------------------------------------------------
@@ -151,10 +135,6 @@ def _rates_for_channel_bw(
     return None
 
 
-def _require_20mhz(target_rate: float) -> None:
-    return
-
-
 def _scale_timing(cfg: "SyncLongConfig", target_rate: float) -> "SyncLongConfig":
     """
     Keep the detector geometry fixed for the existing 64-sample / 80-sample
@@ -166,37 +146,6 @@ def _scale_timing(cfg: "SyncLongConfig", target_rate: float) -> "SyncLongConfig"
 
     from dataclasses import replace
     return replace(cfg, samp_rate=target_rate)
-
-
-def _resolution_for_input_rate(src_rate: float) -> float:
-    """
-    Map the *input-rate hypothesis* to the CFO search resolution.
-
-    Requested mapping:
-      - 30.72 MHz or 40 MHz     -> 2
-      - 61.44 MHz or 80 MHz     -> 4
-      - 122.88 MHz or 160 MHz   -> 8
-
-    Notes
-    -----
-    - The mapping depends on the source/input hypothesis rate, not the target
-      output rate (which remains 20 MHz in this tool).
-    - A small relative tolerance is used so exact floating-point equality is
-      not required.
-    """
-    rate_mhz = float(src_rate) / 1e6
-
-    def _matches(target_mhz: float) -> bool:
-        return abs(rate_mhz - target_mhz) <= 1e-6 * max(1.0, target_mhz)
-
-    if _matches(30.72) or _matches(40.0):
-        return 2.0
-    if _matches(61.44) or _matches(80.0):
-        return 4.0
-    if _matches(122.88) or _matches(160.0):
-        return 8.0
-    return 2.0
-
 
 # ===========================================================================
 # Low-level FFT helpers
@@ -260,7 +209,7 @@ LONG_TRAINING = np.array([
 
 @dataclass
 class SyncLongConfig:
-    # Target output sample rate in Hz. This standalone tool is fixed at 20 MHz.
+    # Target output sample rate in Hz.
     samp_rate:               float = TARGET_SAMP_RATE
     expected_gap:            int   = 64
     with_freqoffset_search:  bool  = True
@@ -515,7 +464,6 @@ def init(cfg: Optional[SyncLongConfig] = None,
 
 def probe_data_len(path: str, samp_rate_in: Optional[float] = None,
                    target_rate: float = TARGET_SAMP_RATE) -> int:
-    _require_20mhz(target_rate)
     """
     Return the number of complex64 samples that will exist *after* resampling,
     without reading the file contents into memory.
@@ -527,8 +475,7 @@ def probe_data_len(path: str, samp_rate_in: Optional[float] = None,
     ----------
     path          : input file path (.mat / .iq / .cfile)
     samp_rate_in  : override source sample rate in Hz (auto-detected if None)
-    target_rate   : desired output rate in Hz. This standalone tool supports
-                    20 MHz only; any other value raises an error.
+    target_rate   : desired output rate in Hz.
 
     Returns
     -------
@@ -653,7 +600,6 @@ def load_file(path: str) -> Tuple[np.ndarray, str]:
 
 def resample(raw: np.ndarray, ext_or_src_rate,
              target_rate: float = TARGET_SAMP_RATE) -> np.ndarray:
-    _require_20mhz(target_rate)
     """
     Rational-rate resample raw IQ to *target_rate*.
 
@@ -662,8 +608,7 @@ def resample(raw: np.ndarray, ext_or_src_rate,
     raw            : raw complex64 samples
     ext_or_src_rate: file extension string (".mat", ".iq", ".cfile")
                      *or* a numeric source sample rate in Hz
-    target_rate    : desired output rate in Hz. This standalone tool supports
-                     20 MHz only; any other value raises an error.
+    target_rate    : desired output rate in Hz.
 
     Returns
     -------
@@ -782,7 +727,7 @@ def detect(iq_data: np.ndarray,
 
     Parameters
     ----------
-    iq_data : np.complex64 array at 20 MHz
+    iq_data : np.complex64 array at the configured target rate
     bank    : CFOFilterBank from init() — rebuilt if None
     cfg     : SyncLongConfig — defaults used if None
 
@@ -878,7 +823,7 @@ def capture(iq_data:   np.ndarray,
 
     Parameters
     ----------
-    iq_data     : complex64 IQ at 20 MHz (same array passed to detect())
+    iq_data     : complex64 IQ at the configured target rate (same array passed to detect())
     detection   : dict returned by detect()
     cfg         : SyncLongConfig — defaults used if None
     output_path : if given, save the capture to this .npz path
@@ -1082,7 +1027,6 @@ def process_file(path: str,
                  output_path: Optional[str] = None,
                  cfg: Optional[SyncLongConfig] = None,
                  target_rate: float = TARGET_SAMP_RATE) -> Dict[str, object]:
-    _require_20mhz(target_rate)
     """
     Run the full pipeline in one call:
         init → load_file → resample → detect → capture
@@ -1092,7 +1036,7 @@ def process_file(path: str,
     path        : input IQ file (.mat / .iq / .cfile)
     output_path : save .npz here (optional)
     cfg         : SyncLongConfig — defaults used if None
-    target_rate : output sample rate in Hz (default 20 MHz; pass 10e6 for 10 MHz)
+    target_rate : output sample rate in Hz
 
     Returns the capture dict (same as capture()).
     """
@@ -1159,20 +1103,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--threshold-scale", type=float, default=0.7,
                    help="Peak threshold scale factor (default: 0.7)")
     p.add_argument("--max-copy",    type=int, default=None,
-                   help="Max samples copied per frame at 20 MHz "
-                        "(default: 43200 = 540 × 80; auto-scaled for other rates)")
+                   help="Max samples copied per frame before CP stripping "
+                        "(default: 43200 = 540 × 80)")
     p.add_argument("--samp-rate-in", type=_float_si, default=None,
                    help="Override source sample rate in Hz "
                         "(auto-detected from extension by default)")
     p.add_argument("--channel-bw", type=int, default=None,
                    choices=[5, 10, 20],
-                   help=(
-                       "Channel bandwidth in MHz — selects the input-rate hypothesis:\n"
-                       "  5  → 4×30.72 MHz (.bin/.mat) / 4×40 MHz (.iq)\n"
-                       "  10 → 2×30.72 MHz (.bin/.mat) / 2×40 MHz (.iq)\n"
-                       "  20 →   30.72 MHz (.bin/.mat) /   40 MHz (.iq)\n"
-                       "Omit to use the legacy multi-hypothesis auto-detect."
-                   ))
+                   help="Channel bandwidth in MHz. When --target-rate is omitted, this selects the processing rate.")
     p.add_argument("--fine-cfo-mode", choices=["tags", "apply"], default="tags",
                    help="How to handle fine CFO in capture output: 'tags' leaves samples unchanged and passes CFO via wifi_start/cfo_long tags; 'apply' rotates samples by the fine CFO and zeros those tags to avoid double correction downstream.")
     p.add_argument("--target-rate", type=_float_si, default=None,
@@ -1221,9 +1159,8 @@ DEFAULT_INPUT_FILE  = r"C:\Users\Public\Documents\Wify\records_files\DJI-Mavic-m
 #DEFAULT_OUTPUT_FILE = None
 DEFAULT_OUTPUT_FILE = "/tmp/out"
 
-# Channel bandwidth hypothesis used when running from an IDE (Spyder / Jupyter).
-# Set to 5, 10, or 20 (MHz) to pin the input-rate hypothesis,
-# or None to use the legacy multi-hypothesis auto-detect.
+# Channel bandwidth used when running from an IDE (Spyder / Jupyter).
+# Set to 5, 10, or 20 MHz, or None to leave it unspecified.
 DEFAULT_CHANNEL_BW: Optional[int] = None   # ← edit here: 5 / 10 / 20 / None
 
 # CFO steps used when running from an IDE (Spyder / Jupyter).
@@ -1247,8 +1184,8 @@ def _detect_iq_dual_hypothesis(
     ----------
     raw                      : raw complex64 samples loaded from the .iq/.bin file
     rate_hypotheses          : list of candidate input sample rates in Hz, e.g. [80e6, 40e6]
-    cfg_base                 : SyncLongConfig at 20 MHz defaults
-    target_rate              : output rate (must be 20 MHz)
+    cfg_base                 : base SyncLongConfig
+    target_rate              : output rate
     Returns
     -------
     (best_iq, best_src_rate, best_detection, best_cfg)
@@ -1321,7 +1258,6 @@ def main():
         args = p.parse_args()
 
     target_rate: float = _resolve_target_rate(args.target_rate, args.channel_bw)
-    _require_20mhz(target_rate)
     print(f"[main] Target sample rate: {target_rate/1e6:.3f} MHz")
 
     channel_bw: Optional[int] = args.channel_bw
@@ -1335,7 +1271,7 @@ def main():
     print(f"[main] CFO search steps: {user_num_cfo_steps}")
     print(f"[main] Fine CFO handling: {fine_cfo_mode}")
 
-    # Build base config at 20 MHz defaults, then scale to target_rate
+    # Build base config, then scale timing-dependent fields to target_rate.
     base_max_copy = args.max_copy if args.max_copy is not None else 540 * 80
     cfg_base = SyncLongConfig(
         with_freqoffset_search = not args.no_cfo_search,
@@ -1343,7 +1279,7 @@ def main():
         cfo_range_hz           = args.cfo_range,
         threshold_scale        = args.threshold_scale,
         max_copy               = base_max_copy,
-        # samp_rate stays at 20e6 here; _scale_timing will update it
+        # _scale_timing will update samp_rate to the selected processing rate
     )
     cfg = _scale_timing(cfg_base, target_rate)
 
