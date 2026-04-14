@@ -844,12 +844,14 @@ def capture(iq_data:   np.ndarray,
         threshold        : float
         sorted_peaks     : int64[P]
         lts_snr_db       : list[float|None]
+        sync_long_peak_abs : list[tuple[int, int]]
     """
     cfg          = cfg or SyncLongConfig()
     fine_cfo_mode = str(fine_cfo_mode).lower()
     if fine_cfo_mode not in ("tags", "apply"):
         raise ValueError(f"Unsupported fine_cfo_mode={fine_cfo_mode!r}; expected 'tags' or 'apply'")
     corr_phase   = _as_c64(detection["corr_long_phase"])
+    corr_long    = np.asarray(detection["corr_long"], dtype=np.float32)
     sorted_peaks = np.asarray(detection["sorted_peaks"], dtype=np.int64)
     shift_bins   = int(detection.get("shift_freq_bins", 0))
 
@@ -877,7 +879,7 @@ def capture(iq_data:   np.ndarray,
             frame_count=0,
             best_freq_hz=float(detection.get("best_freq_hz", 0.0)),
             threshold=float(detection.get("threshold", 0.0)),
-            sorted_peaks=sorted_peaks, lts_snr_db=[],
+            sorted_peaks=sorted_peaks, lts_snr_db=[], sync_long_peak_abs=np.zeros((0, 2), dtype=np.int32),
         )
         print("[capture] No frames found — empty capture returned")
         return result
@@ -892,6 +894,7 @@ def capture(iq_data:   np.ndarray,
     tag_values_u64:    List[int]   = []
     tag_value_types:   List[str]   = []
     lts_snr_list:      List[Optional[float]] = []
+    sync_long_peak_abs_list: List[tuple[int, int]] = []
     n_out_total = 0
     frame_count = 0
 
@@ -941,6 +944,10 @@ def capture(iq_data:   np.ndarray,
         tag_off      = n_out_total
         n_out_total += n_out
         frame_count += 1
+        sync_long_peak_abs_list.append((
+            int(np.rint(float(corr_long[int(p1)]))),
+            int(np.rint(float(corr_long[int(p2)]))),
+        ))
         lts_snr_list.append(_lts_snr_db(iq_fcorr, int(p1), int(p2)))
         all_samples.append(out)
 
@@ -997,6 +1004,7 @@ def capture(iq_data:   np.ndarray,
         threshold       = float(detection.get("threshold", 0.0)),
         sorted_peaks    = sorted_peaks,
         lts_snr_db      = lts_snr_list,
+        sync_long_peak_abs = np.asarray(sync_long_peak_abs_list, dtype=np.int32),
         target_samp_rate_hz=float(cfg.samp_rate),
         fine_cfo_mode    = fine_cfo_mode,
     )
@@ -1011,6 +1019,7 @@ def capture(iq_data:   np.ndarray,
             tag_values_f64  = result["tag_values_f64"],
             tag_values_u64  = result["tag_values_u64"],
             tag_value_types = result["tag_value_types"],
+            sync_long_peak_abs = np.asarray(result["sync_long_peak_abs"], dtype=np.int32),
             target_samp_rate_hz = np.asarray(result["target_samp_rate_hz"], dtype=np.float64),
             fine_cfo_mode = np.asarray(result["fine_cfo_mode"], dtype=object),
         )

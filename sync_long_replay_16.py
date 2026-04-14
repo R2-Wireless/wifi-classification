@@ -495,8 +495,10 @@ def _print_replay_frame_table(cap: dict, decoded_frames: list[dict], resolver=No
     tag_values_f64 = np.asarray(cap.get("tag_values_f64", []), dtype=np.float64)
     tag_value_types = np.asarray(cap.get("tag_value_types", []))
     frame_count = int(cap.get("frame_count", 0))
+    sync_long_peak_abs = np.asarray(cap.get("sync_long_peak_abs", []), dtype=np.int32)
     lts_snr_db = list(cap.get("lts_snr_db", []) or [])
     samp_rate_hz = float(np.asarray(cap.get("target_samp_rate_hz", 20e6)).reshape(-1)[0])
+    cfo_long_rad_by_frame: dict[int, float] = {}
     cfo_long_hz_by_frame: dict[int, float] = {}
     cfo_idx = 0
     for idx in range(len(tag_keys)):
@@ -506,15 +508,19 @@ def _print_replay_frame_table(cap: dict, decoded_frames: list[dict], resolver=No
             continue
         frame_id = cfo_idx + 1
         cfo_rad_per_samp = float(tag_values_f64[idx])
+        cfo_long_rad_by_frame[frame_id] = cfo_rad_per_samp
         cfo_long_hz_by_frame[frame_id] = cfo_rad_per_samp * samp_rate_hz / (2.0 * np.pi)
         cfo_idx += 1
 
     width_id = 10
+    width_peak1 = 8
+    width_peak2 = 8
     width_lts = 8
     width_eq = 22
     width_type = 28
     width_rate = 22
     width_bytes = 7
+    width_cfo_rad = 14
     width_cfo = 12
     width_dec = 16
     width_out = 30
@@ -528,11 +534,14 @@ def _print_replay_frame_table(cap: dict, decoded_frames: list[dict], resolver=No
 
     sep = (
         "+" + "-" * (width_id + 2) +
+        "+" + "-" * (width_peak1 + 2) +
+        "+" + "-" * (width_peak2 + 2) +
         "+" + "-" * (width_lts + 2) +
         "+" + "-" * (width_eq + 2) +
         "+" + "-" * (width_type + 2) +
         "+" + "-" * (width_rate + 2) +
         "+" + "-" * (width_bytes + 2) +
+        "+" + "-" * (width_cfo_rad + 2) +
         "+" + "-" * (width_cfo + 2) +
         "+" + "-" * (width_dec + 2) +
         "+" + "-" * (width_out + 2) + "+"
@@ -543,11 +552,14 @@ def _print_replay_frame_table(cap: dict, decoded_frames: list[dict], resolver=No
     print(
         "[frame_trace] | "
         f"{cell('frame_id', width_id)} | "
+        f"{cell('peak_1', width_peak1)} | "
+        f"{cell('peak_2', width_peak2)} | "
         f"{cell('lts_snr', width_lts)} | "
         f"{cell('equalizer', width_eq)} | "
         f"{cell('frame_type', width_type)} | "
         f"{cell('rate', width_rate)} | "
         f"{cell('bytes', width_bytes)} | "
+        f"{cell('cfo_long_rad', width_cfo_rad)} | "
         f"{cell('cfo_long_hz', width_cfo)} | "
         f"{cell('decode_mac', width_dec)} | "
         f"{cell('outcome', width_out)} |"
@@ -563,6 +575,7 @@ def _print_replay_frame_table(cap: dict, decoded_frames: list[dict], resolver=No
             frame_type = "-"
             rate_text = ""
             bytes_text = ""
+            cfo_rad_text = ""
             cfo_text = ""
             outcome = ""
         else:
@@ -574,7 +587,9 @@ def _print_replay_frame_table(cap: dict, decoded_frames: list[dict], resolver=No
             frame_type = f"{type_name}/{subtype_name}"
             rate_text = _rate_str(pdu.get("signal_encoding"))
             bytes_text = str(len(bytes(pdu.get("data", b""))))
+            cfo_rad = cfo_long_rad_by_frame.get(frame_id)
             cfo_hz = cfo_long_hz_by_frame.get(frame_id)
+            cfo_rad_text = f"{cfo_rad:.6g}" if cfo_rad is not None else ""
             cfo_text = f"{cfo_hz:.1f}" if cfo_hz is not None else ""
 
             vendor = _vendor_for_roles(resolver, pdu.get("roles", {}) or {})
@@ -582,17 +597,28 @@ def _print_replay_frame_table(cap: dict, decoded_frames: list[dict], resolver=No
             outcome = vendor or (f"SNR={float(snr_db):.1f} dB" if snr_db is not None else "")
 
         lts_text = "-"
+        peak1_text = "-"
+        peak2_text = "-"
+        if idx < len(sync_long_peak_abs):
+            peaks = np.asarray(sync_long_peak_abs[idx]).reshape(-1)
+            if len(peaks) >= 1:
+                peak1_text = str(int(peaks[0]))
+            if len(peaks) >= 2:
+                peak2_text = str(int(peaks[1]))
         if idx < len(lts_snr_db) and lts_snr_db[idx] is not None:
             lts_text = f"{float(lts_snr_db[idx]):.1f} dB"
 
         print(
             "[frame_trace] | "
             f"{cell(str(frame_id), width_id)} | "
+            f"{cell(peak1_text, width_peak1)} | "
+            f"{cell(peak2_text, width_peak2)} | "
             f"{cell(lts_text, width_lts)} | "
             f"{cell(eq_status, width_eq)} | "
             f"{cell(frame_type, width_type)} | "
             f"{cell(rate_text, width_rate)} | "
             f"{cell(bytes_text, width_bytes)} | "
+            f"{cell(cfo_rad_text, width_cfo_rad)} | "
             f"{cell(cfo_text, width_cfo)} | "
             f"{cell(dec_status, width_dec)} | "
             f"{cell(outcome, width_out)} |"
