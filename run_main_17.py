@@ -135,6 +135,24 @@ def _rates_for_channel_bw(
     return None
 
 
+def _resolve_chan_est(name: str):
+    name = str(name).strip().lower()
+    import ieee802_11
+
+    mapping = {
+        "ls": ieee802_11.LS,
+        "lms": ieee802_11.LMS,
+        "sta": ieee802_11.STA,
+        "comb": ieee802_11.COMB,
+    }
+    try:
+        return mapping[name]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported --chan-est {name!r}; expected one of: ls, lms, sta, comb"
+        ) from exc
+
+
 def _scale_timing(cfg: "SyncLongConfig", target_rate: float) -> "SyncLongConfig":
     """
     Keep the detector geometry fixed for the existing 64-sample / 80-sample
@@ -899,7 +917,7 @@ def capture(iq_data:   np.ndarray,
     frame_count = 0
 
     for idx_fr, (p1, p2) in enumerate(peaks_per_frame, start=1):
-        frame_start = int(p1) - 64
+        frame_start = int(p1) - 64 - 0
         if frame_start < 0 or int(p2) >= corr_len:
             continue
 
@@ -1130,6 +1148,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="PCAP output path used with --replay-direct (default: /tmp/replay_output.pcap).")
     p.add_argument("--replay-freq", type=_float_si, default=5.180e9,
                    help="Center frequency in Hz used with --replay-direct (default: 5.180e9).")
+    p.add_argument("--chan-est", choices=["ls", "lms", "sta", "comb"], default="ls",
+                   help="Replay-side channel equalizer used with --replay-direct (default: ls).")
     p.add_argument("--replay-compact", action="store_true",
                    help="Reduce replay-side verbosity when using --replay-direct.")
     return p
@@ -1372,6 +1392,7 @@ def main():
             output_pcap=args.output_pcap,
             freq=float(args.replay_freq),
             samp_rate=float(cfg.samp_rate),
+            chan_est=_resolve_chan_est(args.chan_est),
             verbose=not args.replay_compact,
         )
     else:

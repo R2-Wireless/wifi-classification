@@ -873,11 +873,12 @@ def run_replay(npz_path: str, output_pcap: str = "/tmp/replay_output.pcap",
 
 def run_replay_capture(cap: dict, output_pcap: str = "/tmp/replay_output.pcap",
                        freq: float = 5.180e9, samp_rate: float | None = None,
-                       verbose: bool = True):
+                       chan_est=None, verbose: bool = True):
     os.environ["WIFI_FRAME_TRACE_DISABLE"] = "1"
     tb = wifi_rx_replay_capture(
         cap, output_pcap,
         freq=freq, samp_rate=samp_rate,
+        chan_est=chan_est,
         verbose=verbose,
     )
     print("[replay] Starting flowgraph …")
