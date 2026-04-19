@@ -165,6 +165,52 @@ def _scale_timing(cfg: "SyncLongConfig", target_rate: float) -> "SyncLongConfig"
     from dataclasses import replace
     return replace(cfg, samp_rate=target_rate)
 
+
+def _dump_sync_long_debug(detection: Dict[str, object]) -> None:
+    """Optionally dump sync-long correlation / detections for offline MATLAB plots.
+
+    Mirrors the file naming used by sync_long.cc when WIFI_DUMP_CORR=1.
+    """
+    if os.getenv("WIFI_DUMP_CORR") is None:
+        return
+
+    corr_long = np.asarray(detection.get("corr_long", []), dtype=np.float32).reshape(-1)
+    corr_long_phase = np.asarray(detection.get("corr_long_phase", []), dtype=np.complex64).reshape(-1)
+    sorted_peaks = np.asarray(detection.get("sorted_peaks", []), dtype=np.int64).reshape(-1)
+
+    mag_path = os.getenv("WIFI_DUMP_LONG_MAG_PATH", "/tmp/sync_long_cor_mag.bin")
+    mag_abs_path = os.getenv("WIFI_DUMP_LONG_MAG_ABS_PATH", "/tmp/sync_long_cor_mag_abs.bin")
+    cplx_path = os.getenv("WIFI_DUMP_LONG_CPLX_PATH", "/tmp/sync_long_cor_cplx.bin")
+    det_path = os.getenv("WIFI_DUMP_LONG_DET_PATH", "/tmp/sync_long_det.bin")
+    det_meta_path = os.getenv("WIFI_DUMP_LONG_DET_META_PATH", "/tmp/sync_long_det_meta.bin")
+
+    corr_long.astype(np.float32, copy=False).tofile(mag_path)
+    corr_long_phase.astype(np.complex64, copy=False).tofile(cplx_path)
+
+    abs_dtype = np.dtype([("idx", np.uint64), ("mag", np.float32)])
+    if len(corr_long):
+        abs_dump = np.empty(len(corr_long), dtype=abs_dtype)
+        abs_dump["idx"] = np.arange(len(corr_long), dtype=np.uint64)
+        abs_dump["mag"] = corr_long
+        abs_dump.tofile(mag_abs_path)
+    else:
+        np.zeros(0, dtype=abs_dtype).tofile(mag_abs_path)
+
+    pair_count = len(sorted_peaks) // 2
+    peak_pairs = sorted_peaks[: pair_count * 2].reshape(pair_count, 2) if pair_count else np.zeros((0, 2), dtype=np.int64)
+    peak_pairs.astype(np.uint64, copy=False).tofile(det_path)
+
+    if pair_count:
+        frame_ids = np.arange(1, pair_count + 1, dtype=np.uint64).reshape(-1, 1)
+        det_meta = np.concatenate((frame_ids, peak_pairs.astype(np.uint64)), axis=1)
+        det_meta.tofile(det_meta_path)
+    else:
+        np.zeros((0, 3), dtype=np.uint64).tofile(det_meta_path)
+
+    print(
+        f"[dump] sync_long correlation written: mag={mag_path} det={det_path}"
+    )
+
 # ===========================================================================
 # Low-level FFT helpers
 # ===========================================================================
@@ -732,6 +778,55 @@ def _sort_long_peaks(peak_indices: np.ndarray, corr: np.ndarray,
     return np.array(filtered, dtype=np.int64)
 
 
+def _pair_long_peaks(peaks: np.ndarray, corr: np.ndarray,
+                     cfg: SyncLongConfig) -> np.ndarray:
+    """Pair accepted peaks using only 63/64/65-sample gaps, preferring 64."""
+    peaks = np.sort(np.asarray(peaks, dtype=np.int64).reshape(-1))
+    if len(peaks) < 2:
+        return np.zeros((0, 2), dtype=np.int64)
+
+    target_gap = int(cfg.expected_gap)
+    allowed_gaps = {target_gap - 1, target_gap, target_gap + 1}
+    used = np.zeros(len(peaks), dtype=bool)
+    pairs: List[tuple[int, int]] = []
+
+    for i in range(len(peaks) - 1):
+        if used[i]:
+            continue
+
+        best_j = None
+        best_key = None
+        p1 = int(peaks[i])
+
+        for j in range(i + 1, len(peaks)):
+            if used[j]:
+                continue
+            gap = int(peaks[j] - p1)
+            if gap > target_gap + 1:
+                break
+            if gap not in allowed_gaps:
+                continue
+
+            # Prefer exact 64-sample spacing, then stronger paired peaks.
+            key = (
+                abs(gap - target_gap),
+                -(float(corr[p1]) + float(corr[int(peaks[j])])),
+                gap,
+            )
+            if best_key is None or key < best_key:
+                best_key = key
+                best_j = j
+
+        if best_j is not None:
+            used[i] = True
+            used[best_j] = True
+            pairs.append((p1, int(peaks[best_j])))
+
+    if not pairs:
+        return np.zeros((0, 2), dtype=np.int64)
+    return np.asarray(pairs, dtype=np.int64)
+
+
 # ---- public detect() -------------------------------------------------------
 
 def detect(iq_data: np.ndarray,
@@ -800,11 +895,13 @@ def detect(iq_data: np.ndarray,
     threshold  = max(float(np.max(corr_long)) * cfg.threshold_scale,
                      5.0 * rms * math.sqrt(seq_energy))
 
-    raw_peaks    = _find_peaks(corr_long, cfg.expected_gap - 4, threshold)
-    sorted_peaks = _sort_long_peaks(raw_peaks, corr_long, cfg)
+    raw_peaks = _find_peaks(corr_long, cfg.expected_gap - 4, threshold)
+    candidate_peaks = _sort_long_peaks(raw_peaks, corr_long, cfg)
+    peak_pairs = _pair_long_peaks(candidate_peaks, corr_long, cfg)
+    sorted_peaks = peak_pairs.reshape(-1) if len(peak_pairs) else np.zeros(0, dtype=np.int64)
 
     dt = time.perf_counter() - t0
-    n_frames = len(sorted_peaks) // 2
+    n_frames = len(peak_pairs)
     print(f"[detect] Done — {len(raw_peaks)} raw peaks → {n_frames} frame pair(s)  "
           f"best_cfo={best_freq_hz/1e3:+.1f} kHz  threshold={threshold:.4f}  "
           f"({dt*1e3:.1f} ms)")
@@ -863,6 +960,7 @@ def capture(iq_data:   np.ndarray,
         sorted_peaks     : int64[P]
         lts_snr_db       : list[float|None]
         sync_long_peak_abs : list[tuple[int, int]]
+        sync_long_peak_idx : list[tuple[int, int]]
     """
     cfg          = cfg or SyncLongConfig()
     fine_cfo_mode = str(fine_cfo_mode).lower()
@@ -897,7 +995,9 @@ def capture(iq_data:   np.ndarray,
             frame_count=0,
             best_freq_hz=float(detection.get("best_freq_hz", 0.0)),
             threshold=float(detection.get("threshold", 0.0)),
-            sorted_peaks=sorted_peaks, lts_snr_db=[], sync_long_peak_abs=np.zeros((0, 2), dtype=np.int32),
+            sorted_peaks=sorted_peaks, lts_snr_db=[],
+            sync_long_peak_abs=np.zeros((0, 2), dtype=np.int32),
+            sync_long_peak_idx=np.zeros((0, 2), dtype=np.int64),
         )
         print("[capture] No frames found — empty capture returned")
         return result
@@ -913,11 +1013,12 @@ def capture(iq_data:   np.ndarray,
     tag_value_types:   List[str]   = []
     lts_snr_list:      List[Optional[float]] = []
     sync_long_peak_abs_list: List[tuple[int, int]] = []
+    sync_long_peak_idx_list: List[tuple[int, int]] = []
     n_out_total = 0
     frame_count = 0
 
     for idx_fr, (p1, p2) in enumerate(peaks_per_frame, start=1):
-        frame_start = int(p1) - 64 - 0
+        frame_start = int(p1) - 64 - 5
         if frame_start < 0 or int(p2) >= corr_len:
             continue
 
@@ -966,6 +1067,7 @@ def capture(iq_data:   np.ndarray,
             int(np.rint(float(corr_long[int(p1)]))),
             int(np.rint(float(corr_long[int(p2)]))),
         ))
+        sync_long_peak_idx_list.append((int(p1), int(p2)))
         lts_snr_list.append(_lts_snr_db(iq_fcorr, int(p1), int(p2)))
         all_samples.append(out)
 
@@ -1023,6 +1125,7 @@ def capture(iq_data:   np.ndarray,
         sorted_peaks    = sorted_peaks,
         lts_snr_db      = lts_snr_list,
         sync_long_peak_abs = np.asarray(sync_long_peak_abs_list, dtype=np.int32),
+        sync_long_peak_idx = np.asarray(sync_long_peak_idx_list, dtype=np.int64),
         target_samp_rate_hz=float(cfg.samp_rate),
         fine_cfo_mode    = fine_cfo_mode,
     )
@@ -1038,6 +1141,7 @@ def capture(iq_data:   np.ndarray,
             tag_values_u64  = result["tag_values_u64"],
             tag_value_types = result["tag_value_types"],
             sync_long_peak_abs = np.asarray(result["sync_long_peak_abs"], dtype=np.int32),
+            sync_long_peak_idx = np.asarray(result["sync_long_peak_idx"], dtype=np.int64),
             target_samp_rate_hz = np.asarray(result["target_samp_rate_hz"], dtype=np.float64),
             fine_cfo_mode = np.asarray(result["fine_cfo_mode"], dtype=object),
         )
@@ -1378,6 +1482,7 @@ def main():
         detection = detect(iq, bank, cfg)
 
     # ---- Stage 5: capture ----
+    _dump_sync_long_debug(detection)
     cap = capture(iq, detection, cfg, output_path=capture_output, fine_cfo_mode=fine_cfo_mode)
 
     dt = time.perf_counter() - t_total

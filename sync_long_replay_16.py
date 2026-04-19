@@ -496,6 +496,7 @@ def _print_replay_frame_table(cap: dict, decoded_frames: list[dict], resolver=No
     tag_value_types = np.asarray(cap.get("tag_value_types", []))
     frame_count = int(cap.get("frame_count", 0))
     sync_long_peak_abs = np.asarray(cap.get("sync_long_peak_abs", []), dtype=np.int32)
+    sync_long_peak_idx = np.asarray(cap.get("sync_long_peak_idx", []), dtype=np.int64)
     lts_snr_db = list(cap.get("lts_snr_db", []) or [])
     samp_rate_hz = float(np.asarray(cap.get("target_samp_rate_hz", 20e6)).reshape(-1)[0])
     cfo_long_rad_by_frame: dict[int, float] = {}
@@ -524,6 +525,7 @@ def _print_replay_frame_table(cap: dict, decoded_frames: list[dict], resolver=No
     width_cfo = 12
     width_dec = 16
     width_out = 30
+    width_gap = 8
 
     def cell(text: str, width: int) -> str:
         if len(text) >= width:
@@ -544,7 +546,8 @@ def _print_replay_frame_table(cap: dict, decoded_frames: list[dict], resolver=No
         "+" + "-" * (width_cfo_rad + 2) +
         "+" + "-" * (width_cfo + 2) +
         "+" + "-" * (width_dec + 2) +
-        "+" + "-" * (width_out + 2) + "+"
+        "+" + "-" * (width_out + 2) +
+        "+" + "-" * (width_gap + 2) + "+"
     )
 
     print("\n[frame_trace] Per-Frame Replay Table")
@@ -562,7 +565,8 @@ def _print_replay_frame_table(cap: dict, decoded_frames: list[dict], resolver=No
         f"{cell('cfo_long_rad', width_cfo_rad)} | "
         f"{cell('cfo_long_hz', width_cfo)} | "
         f"{cell('decode_mac', width_dec)} | "
-        f"{cell('outcome', width_out)} |"
+        f"{cell('outcome', width_out)} | "
+        f"{cell('gap', width_gap)} |"
     )
     print(f"[frame_trace] {sep}")
 
@@ -599,12 +603,17 @@ def _print_replay_frame_table(cap: dict, decoded_frames: list[dict], resolver=No
         lts_text = "-"
         peak1_text = "-"
         peak2_text = "-"
+        gap_text = "-"
         if idx < len(sync_long_peak_abs):
             peaks = np.asarray(sync_long_peak_abs[idx]).reshape(-1)
             if len(peaks) >= 1:
                 peak1_text = str(int(peaks[0]))
             if len(peaks) >= 2:
                 peak2_text = str(int(peaks[1]))
+        if idx < len(sync_long_peak_idx):
+            peak_idx = np.asarray(sync_long_peak_idx[idx]).reshape(-1)
+            if len(peak_idx) >= 2:
+                gap_text = str(int(peak_idx[1]) - int(peak_idx[0]))
         if idx < len(lts_snr_db) and lts_snr_db[idx] is not None:
             lts_text = f"{float(lts_snr_db[idx]):.1f} dB"
 
@@ -621,7 +630,8 @@ def _print_replay_frame_table(cap: dict, decoded_frames: list[dict], resolver=No
             f"{cell(cfo_rad_text, width_cfo_rad)} | "
             f"{cell(cfo_text, width_cfo)} | "
             f"{cell(dec_status, width_dec)} | "
-            f"{cell(outcome, width_out)} |"
+            f"{cell(outcome, width_out)} | "
+            f"{cell(gap_text, width_gap)} |"
         )
 
     print(f"[frame_trace] {sep}")
