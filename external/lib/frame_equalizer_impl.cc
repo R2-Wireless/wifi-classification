@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cstdio>
 #include <iostream>
+#include <cstdlib>
 
 namespace gr {
 namespace ieee802_11 {
@@ -143,6 +144,22 @@ int frame_equalizer_impl::general_work(int noutput_items,
 
     const gr_complex* in = (const gr_complex*)input_items[0];
     uint8_t* out = (uint8_t*)output_items[0];
+
+    // Optional equalized-constellation dump for offline plotting.
+    // Enable with WIFI_DUMP_CORR=1 and optionally override path with
+    // WIFI_DUMP_CONST_PATH=/tmp/wifi_constellation_eq.bin
+    static bool dump_init = false;
+    static bool dump_enabled = false;
+    static FILE* fp_constellation = nullptr;
+    if (!dump_init) {
+        dump_init = true;
+        dump_enabled = (std::getenv("WIFI_DUMP_CORR") != nullptr);
+        if (dump_enabled) {
+            const char* const_path = std::getenv("WIFI_DUMP_CONST_PATH");
+            fp_constellation = std::fopen(
+                const_path ? const_path : "/tmp/wifi_constellation_eq.bin", "ab");
+        }
+    }
 
     int i = 0;
     int o = 0;
@@ -321,6 +338,18 @@ int frame_equalizer_impl::general_work(int noutput_items,
         }
 
         if (d_current_symbol > 2) {
+            if (dump_enabled && fp_constellation) {
+                const uint64_t frame_id = d_current_frame_id;
+                const uint64_t symbol_index = static_cast<uint64_t>(d_current_symbol - 3);
+                const uint64_t encoding = static_cast<uint64_t>(d_frame_encoding);
+                const uint64_t n_subcarriers = 48;
+                std::fwrite(&frame_id, sizeof(uint64_t), 1, fp_constellation);
+                std::fwrite(&symbol_index, sizeof(uint64_t), 1, fp_constellation);
+                std::fwrite(&encoding, sizeof(uint64_t), 1, fp_constellation);
+                std::fwrite(&n_subcarriers, sizeof(uint64_t), 1, fp_constellation);
+                std::fwrite(symbols, sizeof(gr_complex), 48, fp_constellation);
+                std::fflush(fp_constellation);
+            }
             o++;
             pmt::pmt_t pdu = pmt::make_dict();
             message_port_pub(
